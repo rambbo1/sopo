@@ -262,11 +262,30 @@ def _new_zero_template():
     return wb
 
 
-def create_zero_rate_attachments(rows, output_dir: Path, company: str, base_dir: Optional[Path] = None):
+def create_zero_rate_attachments(
+    rows,
+    output_dir: Path,
+    company: str,
+    base_dir: Optional[Path] = None,
+    mode: str = "both",
+):
+    """영세율첨부서류제출명세서 생성.
+
+    mode:
+      - "all" 또는 "전체": 전체 파일만 생성
+      - "monthly" 또는 "월별": 월별 파일만 생성
+      - "both" 또는 "전체+월별": 전체와 월별을 모두 생성
+    """
     output_dir = Path(output_dir)
     base_dir = Path(base_dir or output_dir)
     template = _find_template(base_dir, "영세율첨부서류명세서 양식.xlsx")
     created = []
+
+    normalized_mode = str(mode or "both").strip().lower()
+    make_all = normalized_mode in {"all", "both", "전체", "전체+월별", "all+monthly"}
+    make_monthly = normalized_mode in {"monthly", "both", "월별", "전체+월별", "all+monthly"}
+    if not make_all and not make_monthly:
+        make_all = True
 
     def make_file(sub_rows, suffix):
         if template:
@@ -279,12 +298,16 @@ def create_zero_rate_attachments(rows, output_dir: Path, company: str, base_dir:
         wb.save(out)
         return out
 
-    created.append(make_file(rows, "전체"))
-    by_month = {}
-    for r in rows:
-        by_month.setdefault(date_to_month_key(r.get("ship_date")), []).append(r)
-    for month_key in sorted(by_month):
-        created.append(make_file(by_month[month_key], month_key))
+    if make_all:
+        created.append(make_file(rows, "전체"))
+
+    if make_monthly:
+        by_month = {}
+        for r in rows:
+            by_month.setdefault(date_to_month_key(r.get("ship_date")), []).append(r)
+        for month_key in sorted(by_month):
+            created.append(make_file(by_month[month_key], month_key))
+
     return created
 
 
