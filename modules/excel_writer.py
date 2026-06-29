@@ -805,6 +805,184 @@ def _prune_workbook_sheets(wb, keep_sheet_names):
         if sheet_name not in keep:
             del wb[sheet_name]
 
+# ── 월별집계 시트 ───────────────────────────────────────────────
+
+def _month_label_from_date(value):
+    """날짜 문자열/숫자에서 'YYYY년 MM월' 라벨을 반환합니다."""
+    d = re.sub(r"\D", "", str(value or ""))[:8]
+    if len(d) >= 6:
+        return f"{d[:4]}년 {d[4:6]}월"
+    return "날짜미상"
+
+
+def write_monthly_summary_sheet(ws, shopee_results: list, lazada_result: Optional[dict],
+                                qoo10_result: Optional[dict], rates: dict,
+                                lazada_avg_rates: dict = None,
+                                lazada_write_date: str = '',
+                                jpy_rate: float = 0.0,
+                                submitter: dict = None):
+    """
+    월별집계 시트 작성.
+    기준일은 각 문서의 수출실적/통화 시트에 들어가는 선(기)적일자와 동일하게 봅니다.
+    - 쇼피: 거래별 발행일(tx['date'])
+    - 라자다: 라자다 작성일자(write_date) 또는 기간 종료일
+    - 큐텐: 입력 건별 발행일(write_date)
+    """
+    NUM = '#,##0'
+    NUM2 = '#,##0.00'
+    lazada_avg_rates = lazada_avg_rates or {}
+
+    for col, width in {'A': 13, 'B': 12, 'C': 10, 'D': 10, 'E': 16, 'F': 16}.items():
+        ws.column_dimensions[col].width = width
+
+    sub = submitter or DEFAULT_SUBMITTER
+    ws['A1'] = f"월별집계 - {sub.get('name','')}({sub.get('biz_no','')})"
+    _style(ws['A1'], font=FONT_TITLE)
+    ws.merge_cells('A1:F1')
+
+    headers = ['월', '구분', '통화코드', '건수', '외화금액', '원화금액']
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=3, column=col, value=h)
+        _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
+
+    rows = []
+
+    # 쇼피: 거래별 발행일 기준
+    for sd in shopee_results or []:
+        cur = sd.get('currency', '')
+        if not cur:
+            continue
+        div = RATE_DIVISOR.get(cur, 1)
+        txs = sd.get('transactions') or []
+        if txs:
+            for tx in txs:
+                amount = float(tx.get('amount', 0) or 0)
+                qty = int(tx.get('qty', 0) or 0)
+                rate = _get_rate(rates, cur, tx.get('date', ''))
+                krw = round(amount * rate / div)
+                rows.append({
+                    'month': _month_label_from_date(tx.get('date', '')),
+                    'source': '쇼피', 'currency': cur, 'qty': qty,
+                    'fx': amount, 'krw': krw,
+                })
+        else:
+            amount = float(sd.get('total_amount', 0) or 0)
+            qty = int(sd.get('total_qty', 0) or 0)
+            rate_date = sd.get('write_date') or sd.get('period_end') or ''
+            rate = _get_rate(rates, cur, rate_date)
+            krw = round(amount * rate / div)
+            rows.append({
+                'month': _month_label_from_date(rate_date),
+                'source': '쇼피', 'currency': cur, 'qty': qty,
+                'fx': amount, 'krw': krw,
+            })
+
+    # 라자다: 작성일자/기간종료일 기준
+    if lazada_result and lazada_result.get('items'):
+        date_value = lazada_write_date or lazada_result.get('write_date') or lazada_result.get('period_end') or ''
+        for it in lazada_result.get('items', []):
+            cur = it.get('currency', '')
+            if not cur:
+                continue
+            amount = float(it.get('amount', 0) or 0)
+            qty = int(it.get('qty', 0) or 0)
+            div = RATE_DIVISOR.get(cur, 1)
+            rate = lazada_avg_rates.get(cur, rates.get(cur, {}).get('average', 0.0))
+            krw = round(amount * rate / div)
+            rows.append({
+                'month': _month_label_from_date(date_value),
+                'source': '라자다', 'currency': cur, 'qty': qty,
+                'fx': amount, 'krw': krw,
+            })
+
+    # 큐텐: 입력 건별 발행일 기준
+    if qoo10_result and qoo10_result.get('entries'):
+        for e in qoo10_result.get('entries', []):
+            amount = float(e.get('amount', 0) or 0)
+            qty = int(e.get('qty', 0) or 0)
+            rate = e.get('rate', jpy_rate)
+            krw = e.get('krw', round(amount * rate / 100))
+            date_value = e.get('write_date') or qoo10_result.get('write_date') or qoo10_result.get('period_end') or ''
+            rows.append({
+                'month': _month_label_from_date(date_value),
+                'source': '큐텐', 'currency': 'JPY', 'qty': qty,
+                'fx': amount, 'krw': krw,
+            })
+
+    # 집계: 월 + 구분 + 통화
+    grouped = {}
+    for item in rows:
+        key = (item['month'], item['source'], item['currency'])
+        if key not in grouped:
+            grouped[key] = {'qty': 0, 'fx': 0.0, 'krw': 0}
+        grouped[key]['qty'] += item['qty']
+        grouped[key]['fx'] += item['fx']
+        grouped[key]['krw'] += item['krw']
+
+    # 출력
+    r = 4
+    grand_qty = 0
+    grand_fx_by_currency = {}
+    grand_krw = 0
+    months = sorted({k[0] for k in grouped.keys()})
+    source_order = {'쇼피': 1, '라자다': 2, '큐텐': 3}
+
+    for month in months:
+        month_qty = 0
+        month_krw = 0
+        month_fx_by_currency = {}
+        keys = sorted(
+            [k for k in grouped.keys() if k[0] == month],
+            key=lambda x: (source_order.get(x[1], 99), PREFERRED_CURRENCY_ORDER.index(x[2]) if x[2] in PREFERRED_CURRENCY_ORDER else 99, x[2])
+        )
+        for _month, source, cur in keys:
+            data = grouped[(_month, source, cur)]
+            vals = [month, source, cur, data['qty'], data['fx'], data['krw']]
+            for col, v in enumerate(vals, 1):
+                c = ws.cell(row=r, column=col, value=v)
+                nf = {4: NUM, 5: NUM2, 6: NUM}.get(col)
+                _style(c, font=FONT_DEFAULT, align=CENTER if col <= 4 else RIGHT, border=THIN_BORDER, num_format=nf)
+            month_qty += data['qty']
+            month_fx_by_currency[cur] = month_fx_by_currency.get(cur, 0.0) + data['fx']
+            month_krw += data['krw']
+            grand_qty += data['qty']
+            grand_fx_by_currency[cur] = grand_fx_by_currency.get(cur, 0.0) + data['fx']
+            grand_krw += data['krw']
+            r += 1
+
+        # 월 합계: 외화는 통화가 여러 개일 수 있으므로 원화 합계 중심으로 표시
+        ws.cell(row=r, column=1, value=month)
+        ws.cell(row=r, column=2, value='월 합계')
+        ws.cell(row=r, column=4, value=month_qty)
+        ws.cell(row=r, column=6, value=month_krw)
+        for col in range(1, 7):
+            c = ws.cell(row=r, column=col)
+            nf = {4: NUM, 6: NUM}.get(col)
+            _style(c, font=FONT_BOLD, fill=GRAY_FILL, align=CENTER if col <= 4 else RIGHT, border=THIN_BORDER, num_format=nf)
+        r += 1
+
+    # 전체 총합
+    ws.cell(row=r, column=1, value='전체')
+    ws.cell(row=r, column=2, value='전체 총합')
+    ws.cell(row=r, column=4, value=grand_qty)
+    ws.cell(row=r, column=6, value=grand_krw)
+    for col in range(1, 7):
+        c = ws.cell(row=r, column=col)
+        nf = {4: NUM, 6: NUM}.get(col)
+        _style(c, font=FONT_BOLD, fill=SUBHEAD_FILL, align=CENTER if col <= 4 else RIGHT, border=THIN_BORDER, num_format=nf)
+
+    # 참고: 통화별 전체 외화 합계
+    r += 2
+    ws.cell(row=r, column=1, value='통화별 외화 합계')
+    _style(ws.cell(row=r, column=1), font=FONT_BOLD)
+    r += 1
+    for cur in _ordered_currencies(grand_fx_by_currency.keys()):
+        ws.cell(row=r, column=2, value=cur)
+        ws.cell(row=r, column=5, value=grand_fx_by_currency.get(cur, 0.0))
+        _style(ws.cell(row=r, column=2), font=FONT_DEFAULT, align=CENTER, border=THIN_BORDER)
+        _style(ws.cell(row=r, column=5), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM2)
+        r += 1
+
 # ── 전체 엑셀 생성 ───────────────────────────────────────────────
 
 def generate_excel(
@@ -947,6 +1125,14 @@ def generate_excel(
                         qoo10_result, jpy_rate,
                         period_label, submitter=report_submitter)
 
+    # ── 월별집계 ─────────────────────────────────────────────
+    # 총집계 바로 오른쪽에 배치합니다.
+    ws_monthly = wb.create_sheet('월별집계', 1)
+    write_monthly_summary_sheet(ws_monthly, shopee_results, lazada_result, qoo10_result,
+                                rates, lazada_avg_rates=lazada_avg_rates,
+                                lazada_write_date=lazada_write_date,
+                                jpy_rate=jpy_rate, submitter=report_submitter)
+
     # ── 통화별 수출신고 템플릿 시트
     # 실제 쇼피/라자다/큐텐 데이터가 있는 통화만 생성합니다.
     for cur in used_currencies:
@@ -1025,7 +1211,7 @@ def generate_excel(
         write_exchange_rate_sheet(ws, rates.get(cur))
 
     # ── 최종 안전장치: 불필요한 시트 삭제
-    keep_sheets = {'총집계'}
+    keep_sheets = {'총집계', '월별집계'}
     keep_sheets.update(cur for cur in used_currencies if cur != 'JPY')
     if qoo10_used:
         keep_sheets.update({'JPY', '큐텐(소포수령증)'})
