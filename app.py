@@ -218,6 +218,15 @@ make_sales = cc1.checkbox("매출집계", value=True)
 make_zero = cc2.checkbox("영세율첨부서류제출명세서", value=True)
 make_export = cc3.checkbox("수출실적명세서", value=True)
 
+zero_doc_mode = "전체"
+if make_zero:
+    zero_doc_mode = st.radio(
+        "영세율첨부서류제출명세서 생성 범위",
+        ["전체", "월별"],
+        horizontal=True,
+        help="전체를 선택하면 전체 통합 파일 1개만, 월별을 선택하면 월별 파일만 생성합니다.",
+    )
+
 st.markdown(
     '<div class="info-box">환율은 서울외국환중개 기간별 매매기준율에서 자동 수집합니다. 이미 수집된 환율은 서버 캐시에 저장하고 부족한 구간만 추가 조회합니다.</div>',
     unsafe_allow_html=True,
@@ -401,9 +410,16 @@ if process_btn:
             if make_zero or make_export:
                 rows = build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates)
                 if make_zero:
-                    zero_files = create_zero_rate_attachments(rows, tmpdir, company, base_dir=BASE_DIR)
+                    zero_mode_arg = "all" if zero_doc_mode == "전체" else "monthly"
+                    zero_files = create_zero_rate_attachments(
+                        rows,
+                        tmpdir,
+                        company,
+                        base_dir=BASE_DIR,
+                        mode=zero_mode_arg,
+                    )
                     created.extend(zero_files)
-                    log(f"[OK] 영세율첨부서류제출명세서 생성: {len(zero_files)}개")
+                    log(f"[OK] 영세율첨부서류제출명세서 생성({zero_doc_mode}): {len(zero_files)}개")
                 if make_export:
                     export_file = create_export_performance(rows, tmpdir, company, base_dir=BASE_DIR)
                     created.append(export_file)
