@@ -15,6 +15,8 @@ import os
 import re
 import time
 import shutil
+import bisect
+import json
 from pathlib import Path
 from datetime import datetime, date
 from urllib.parse import urlencode
@@ -26,6 +28,12 @@ import requests
 SMBS_STD_RATE_URL = "http://www.smbs.biz/ExRate/StdExRate.jsp"
 SMBS_STD_RATE_PRINT_URL = "http://www.smbs.biz/ExRate/StdExRate_print.jsp"
 RATE_CACHE_FILE = Path(__file__).resolve().parents[1] / "data" / "exchange_rate_cache.csv"
+_FIXED_RATE_JSON_CANDIDATES = [
+    Path(__file__).resolve().parents[1] / "data" / "fixed_rates_2025.json",
+    Path(__file__).resolve().parents[1] / "fixed_rates_2025.json",
+    Path.cwd() / "data" / "fixed_rates_2025.json",
+    Path.cwd() / "fixed_rates_2025.json",
+]
 RATE_LOOKBACK_DAYS = 7
 
 CURRENCY_NAMES = {
@@ -201,6 +209,55 @@ def clean_smbs_rate_dataframe(df, currency):
     return out[["date", "rate"]].copy()
 
 
+
+def _norm_date_key(value) -> str:
+    """환율 색인용 날짜 문자열(YYYY.MM.DD)로 정규화합니다."""
+    dt = parse_date(value)
+    if pd.isna(dt):
+        return ""
+    return pd.to_datetime(dt).strftime("%Y.%m.%d")
+
+
+def load_fixed_rate_json(currency: str, start_date=None, end_date=None) -> pd.DataFrame:
+    """기존 GitHub에 fixed_rates_2025.json이 있으면 사이트 접속 없이 사용합니다.
+    파일이 없거나 JSON 형식이 아니면 빈 DataFrame을 반환합니다.
+    """
+    cur = str(currency).upper()
+    for path in _FIXED_RATE_JSON_CANDIDATES:
+        try:
+            if not path.exists() or path.stat().st_size <= 2:
+                continue
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+            rates = raw.get("rates", raw)
+            daymap = rates.get(cur)
+            if not isinstance(daymap, dict):
+                continue
+            rows = []
+            for d, r in daymap.items():
+                dt = parse_date(d)
+                val = to_number(r)
+                if pd.isna(dt) or val is None:
+                    continue
+                rows.append({"date": dt, "rate": val})
+            if not rows:
+                continue
+            df = clean_smbs_rate_dataframe(pd.DataFrame(rows), cur)
+            if start_date is not None and end_date is not None:
+                sdt = pd.to_datetime(start_date).normalize()
+                edt = pd.to_datetime(end_date).normalize()
+                prev = df[df["date"] < sdt].sort_values("date").tail(1)
+                data = df[(df["date"] >= sdt) & (df["date"] <= edt)].copy()
+                if not prev.empty:
+                    data = pd.concat([prev, data], ignore_index=True)
+                if data.empty:
+                    continue
+                return fill_missing_dates(data[["date", "rate"]], sdt, edt)
+            return df
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["date", "rate"])
+
 def build_smbs_std_params(currency, start_date, end_date):
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date)
@@ -325,7 +382,7 @@ def parse_rate_table_from_html(html, currency, debug_prefix=None):
     return max(candidates, key=len)[["date", "rate"]].copy()
 
 
-def try_fetch_std_rates_by_requests(currency, start_date, end_date, timeout=20):
+def try_fetch_std_rates_by_requests(currency, start_date, end_date, timeout=10):
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
@@ -335,11 +392,18 @@ def try_fetch_std_rates_by_requests(currency, start_date, end_date, timeout=20):
         "Origin": "http://www.smbs.biz",
     }
     params = build_smbs_std_params(currency, start_date, end_date)
+    start_compact = pd.to_datetime(start_date).strftime("%Y%m%d")
+    end_compact = pd.to_datetime(end_date).strftime("%Y%m%d")
+    legacy_params = {"yyyymmdd1": start_compact, "yyyymmdd2": end_compact, "curCd": currency}
+    legacy_post = dict(legacy_params)
+    legacy_post["gubun"] = "1"
     try:
-        session.get(SMBS_STD_RATE_URL, headers=headers, timeout=timeout)
+        session.get(SMBS_STD_RATE_URL, headers=headers, timeout=min(timeout, 8))
     except Exception:
         pass
     attempts = [
+        ("legacy_get", "GET", SMBS_STD_RATE_URL, legacy_params),
+        ("legacy_post", "POST", SMBS_STD_RATE_URL, legacy_post),
         ("print_get", "GET", build_smbs_std_url(currency, start_date, end_date, SMBS_STD_RATE_PRINT_URL), None),
         ("direct_get", "GET", build_smbs_std_url(currency, start_date, end_date, SMBS_STD_RATE_URL), None),
         ("get_params", "GET", SMBS_STD_RATE_URL, params),
@@ -544,6 +608,12 @@ def get_cached_or_fetch_smbs_period_rates(currency, start_date, end_date):
         data = cache[(cache["date"] >= start_date) & (cache["date"] <= end_date)].copy()
         return data[["date", "rate"]].drop_duplicates(subset=["date"], keep="last").sort_values("date")
 
+    fixed = load_fixed_rate_json(currency, start_date, end_date)
+    if fixed is not None and not fixed.empty and _has_full_daily_cache(fixed.assign(currency=currency), start_date, end_date):
+        _log(f"  - {currency}: 저장된 고정환율 사용")
+        save_rate_cache(currency, fixed)
+        return fixed[["date", "rate"]].drop_duplicates(subset=["date"], keep="last").sort_values("date")
+
     segments = []
     if cache.empty:
         segments.append((start_date, end_date))
@@ -668,57 +738,88 @@ def fetch_all_currencies(year: int, month: int, currencies: Iterable[str]):
     return fetch_all_currencies_for_period(first, last, currencies)
 
 
+
 def _daily_frame(rate_data):
     if not rate_data or not rate_data.get("daily"):
         return pd.DataFrame(columns=["date", "rate"])
+    cached = rate_data.get("_daily_frame_cache")
+    if cached is not None:
+        return cached
     df = pd.DataFrame(rate_data.get("daily", []))
-    df["date"] = pd.to_datetime(df["date"].apply(parse_date)).dt.normalize()
+    df["date"] = pd.to_datetime(df["date"].apply(parse_date), errors="coerce").dt.normalize()
     df["rate"] = df["rate"].apply(to_number)
     df = df.dropna(subset=["date", "rate"]).drop_duplicates(subset=["date"], keep="last").sort_values("date")
-    return df[["date", "rate"]]
+    df = df[["date", "rate"]]
+    rate_data["_daily_frame_cache"] = df
+    return df
+
+
+def _date_index(rate_data):
+    """대량 거래 환율 조회용 색인. 한 번 만들고 계속 재사용합니다."""
+    if not rate_data or not rate_data.get("daily"):
+        return {"exact": {}, "dates": [], "rates": []}
+    idx = rate_data.get("_date_index")
+    if idx is not None:
+        return idx
+    exact = {}
+    for d in rate_data.get("daily", []):
+        key = _norm_date_key(d.get("date"))
+        rate = to_number(d.get("rate"))
+        if key and rate is not None:
+            exact[key] = float(rate)
+    dates = sorted(exact.keys())
+    idx = {"exact": exact, "dates": dates, "rates": [exact[x] for x in dates]}
+    rate_data["_date_index"] = idx
+    return idx
 
 
 def get_rate_for_date(rate_data: dict, date_str: str) -> float:
+    """특정 날짜 환율 반환. 없으면 가장 가까운 이전 영업일 환율 사용.
+    기존 GitHub처럼 날짜 색인을 캐싱해서 대량 거래 계산 속도를 높입니다.
+    """
     if not rate_data:
         return 0.0
     if not rate_data.get("daily"):
         return float(rate_data.get("average", 0.0) or 0.0)
-    target = parse_date(date_str)
-    if pd.isna(target):
+    target = _norm_date_key(date_str)
+    if not target:
         return float(rate_data.get("average", 0.0) or 0.0)
-    df = _daily_frame(rate_data)
-    if df.empty:
+    idx = _date_index(rate_data)
+    if target in idx["exact"]:
+        return float(idx["exact"][target])
+    dates = idx["dates"]
+    rates = idx["rates"]
+    if not dates:
         return float(rate_data.get("average", 0.0) or 0.0)
-    prev = df[df["date"] <= target].tail(1)
-    if not prev.empty:
-        return float(prev["rate"].iloc[0])
-    return float(df["rate"].iloc[0])
+    pos = bisect.bisect_right(dates, target)
+    if pos <= 0:
+        return float(rates[0])
+    return float(rates[pos - 1])
 
 
 def avg_rate_for_period(rate_data: dict, start: str, end: str) -> float:
+    """기간 평균환율. pandas DataFrame 재생성을 피하고 날짜 색인을 재사용합니다."""
     if not rate_data:
         return 0.0
     if not rate_data.get("daily"):
         return float(rate_data.get("average", 0.0) or 0.0)
-    s = parse_date(start)
-    e = parse_date(end)
-    if pd.isna(s) and pd.isna(e):
+    s = _norm_date_key(start)
+    e = _norm_date_key(end)
+    if not s and not e:
         return float(rate_data.get("average", 0.0) or 0.0)
-    if pd.isna(s):
+    if not s:
         s = e
-    if pd.isna(e):
+    if not e:
         e = s
     if e < s:
         s, e = e, s
-    df = _daily_frame(rate_data)
-    if df.empty:
+    idx = _date_index(rate_data)
+    dates, rates = idx["dates"], idx["rates"]
+    if not dates:
         return float(rate_data.get("average", 0.0) or 0.0)
-    # 기간 시작이 휴일일 수 있으므로 직전값 포함 후 일별 ffill 평균
-    prev = df[df["date"] < s].tail(1)
-    period = df[(df["date"] >= s) & (df["date"] <= e)].copy()
-    if not prev.empty:
-        period = pd.concat([prev, period], ignore_index=True)
-    if period.empty:
-        return get_rate_for_date(rate_data, e)
-    filled = fill_missing_dates(period, s, e)
-    return round(float(filled["rate"].mean()), 4) if not filled.empty else 0.0
+    left = bisect.bisect_left(dates, s)
+    right = bisect.bisect_right(dates, e)
+    vals = [r for r in rates[left:right] if r and r > 0]
+    if vals:
+        return round(sum(vals) / len(vals), 4)
+    return get_rate_for_date(rate_data, e) or float(rate_data.get("average", 0.0) or 0.0)
