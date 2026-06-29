@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -322,6 +323,7 @@ if process_btn:
 
         try:
             # PDF 파싱
+            t_pdf = time.perf_counter()
             progress_bar.progress(15, text="📄 PDF 분석 중...")
             log("📄 PDF 분석 중...")
             shopee_results = []
@@ -350,6 +352,7 @@ if process_btn:
 
             if not shopee_results and not lazada_result and not qoo10_result:
                 raise RuntimeError("처리할 데이터가 없습니다. PDF 또는 큐텐 수동 입력을 확인해 주세요.")
+            log(f"✅ PDF 분석 완료 ({time.perf_counter() - t_pdf:.1f}초)")
 
             # 환율 수집
             needed = _needed_currencies(shopee_results, lazada_result, qoo10_result)
@@ -362,8 +365,10 @@ if process_btn:
                 rate_start = min(date_values) - pd.Timedelta(days=RATE_LOOKBACK_DAYS)
                 rate_end = max(date_values)
 
-            progress_bar.progress(45, text="💱 환율 수집 중...")
+            t_rate = time.perf_counter()
+            progress_bar.progress(45, text="💱 환율 확인 중...")
             rates = fetch_all_currencies_for_period(rate_start, rate_end, needed, logger=log)
+            log(f"✅ 환율 확인 완료 ({time.perf_counter() - t_rate:.1f}초)")
 
             # 출력 라벨/파일명
             year = rate_end.year
@@ -373,6 +378,7 @@ if process_btn:
             company = company_name_from_results(shopee_results, lazada_result, qoo10_result)
 
             created = []
+            t_excel = time.perf_counter()
             progress_bar.progress(75, text="📊 엑셀 생성 중...")
             log("📊 선택한 문서 생성 중...")
 
@@ -411,6 +417,7 @@ if process_btn:
                     "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 })
             st.session_state.result_files = result_files
+            log(f"✅ 문서 생성 완료 ({time.perf_counter() - t_excel:.1f}초)")
             progress_bar.progress(100, text="✅ 완료")
             status_text.success(f"✅ 엑셀 생성 완료! — {disp_label}")
             log("✅ 전체 처리 완료")
