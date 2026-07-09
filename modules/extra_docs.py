@@ -17,8 +17,8 @@ from .exchange_rate import get_rate_for_date, avg_rate_for_period
 RATE_DIVISOR = {"JPY": 100, "VND": 100}
 TRACKING_NO_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{13}$", re.I)
 
-# L/C 번호 또는 수출신고번호에는 운송장번호를 넣지 않습니다.
-# 영세율 증빙은 기타영세율건수 1로 신고합니다.
+# 수출실적명세서/통화 시트의 수출신고번호는 공란, 기타영세율건수는 1로 신고합니다.
+# 영세율첨부서류제출명세서의 L/C 번호 칸에는 증빙 식별을 위해 운송장번호를 입력합니다.
 
 HEADER_FILL = PatternFill("solid", fgColor="D9E1F2")
 THIN_BORDER = Border(
@@ -239,7 +239,7 @@ def _write_zero_sheet(ws, rows):
         if idx > start_row:
             _copy_style(ws, start_row, idx, max_col)
         vals = [
-            1, "소포수령증", r["issuer"], r["issue_date"], r["ship_date"], "", "",
+            1, "소포수령증", r["issuer"], r["issue_date"], r["ship_date"], r.get("tracking_no", ""), "",
             r["currency"], r["rate"], r["foreign"], r["krw"], r["foreign"], r["krw"], 0, 0,
         ]
         for c, v in enumerate(vals, 1):
