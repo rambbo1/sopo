@@ -389,7 +389,7 @@ def write_shopee_sheet(ws, shopee_data: dict, rates: dict, submitter: dict = Non
 # ── 통화별 수출신고 템플릿 시트 작성 ─────────────────────────────
 
 def write_currency_template_sheet(ws, currency: str,
-                                   shopee_data: Optional[dict],
+                                   shopee_data: Optional[object],
                                    lazada_items: list,
                                    rates: dict,
                                    lazada_write_date: str = '',
@@ -411,14 +411,38 @@ def write_currency_template_sheet(ws, currency: str,
                    else rates.get(currency, {}).get('average', 0.0))
     divisor     = RATE_DIVISOR.get(currency, 1)   # VND·JPY → 100, 나머지 → 1
 
-    # ── 쇼피 소계: 각 거래의 발행일 기준 환율 합산 ──
+    # ── 쇼피 소계: 같은 통화의 PDF가 여러 개여도 모두 합산합니다. ──
+    if isinstance(shopee_data, list):
+        shopee_items = [sd for sd in shopee_data if sd]
+    elif shopee_data:
+        shopee_items = [shopee_data]
+    else:
+        shopee_items = []
+    shopee_items = sorted(shopee_items, key=_shopee_sort_key)
+
+    shopee_transactions = []
     shopee_fx  = 0.0
     shopee_krw = 0
-    if shopee_data:
-        for tx in shopee_data.get('transactions', []):
-            tx_rate = _get_rate(rates, currency, tx['date'])
-            shopee_fx  += tx['amount']
-            shopee_krw += round(tx['amount'] * tx_rate / divisor)
+    for sd in shopee_items:
+        txs = sd.get('transactions', []) or []
+        if txs:
+            shopee_transactions.extend(txs)
+            for tx in txs:
+                tx_rate = _get_rate(rates, currency, tx.get('date', ''))
+                amount = float(tx.get('amount', 0) or 0)
+                shopee_fx  += amount
+                shopee_krw += round(amount * tx_rate / divisor)
+        else:
+            # 거래별 상세가 없을 때는 소계만 합산합니다.
+            amount = float(sd.get('total_amount', 0) or 0)
+            rate_date = sd.get('write_date') or sd.get('period_end') or ''
+            tx_rate = _get_rate(rates, currency, rate_date)
+            shopee_fx += amount
+            shopee_krw += round(amount * tx_rate / divisor)
+
+    shopee_transactions.sort(
+        key=lambda tx: (_date_to_int(tx.get('date')) or 0, str(tx.get('tracking_no', '')))
+    )
 
     # ── 라자다 소계 ──
     lazada_fx  = sum(it['amount'] for it in lazada_items)
@@ -447,14 +471,14 @@ def write_currency_template_sheet(ws, currency: str,
         c = ws.cell(row=4, column=col, value=h)
         _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
 
-    # ── 행 5+: 쇼피 거래 (각 발행일 기준 환율 개별 적용) ──
+    # ── 행 5+: 쇼피 거래 (여러 PDF를 한 시트에 합쳐 날짜순 정렬) ──
     data_row = 5
-    transactions = shopee_data.get('transactions', []) if shopee_data else []
-    for tx in transactions:
-        tx_rate  = _get_rate(rates, currency, tx['date'])
-        krw      = round(tx['amount'] * tx_rate / divisor)
-        date_int = int(tx['date'].replace('.', '').replace('-', ''))
-        row_vals = [tx.get('tracking_no', ''), other_zero_rate_count_value(tx.get('tracking_no', '')), date_int, currency, tx_rate, tx['amount'], krw]
+    for tx in shopee_transactions:
+        tx_rate  = _get_rate(rates, currency, tx.get('date', ''))
+        amount   = float(tx.get('amount', 0) or 0)
+        krw      = round(amount * tx_rate / divisor)
+        date_int = _date_to_int(tx.get('date', ''))
+        row_vals = [tx.get('tracking_no', ''), other_zero_rate_count_value(tx.get('tracking_no', '')), date_int, currency, tx_rate, amount, krw]
         for col, v in enumerate(row_vals, 1):
             c = ws.cell(row=data_row, column=col, value=v)
             nf = {5: NUM_FMT2, 6: NUM_FMT2, 7: NUM_FMT}.get(col)
@@ -755,6 +779,46 @@ def _ordered_currencies(values):
     """PREFERRED_CURRENCY_ORDER 기준으로 통화코드를 정렬합니다."""
     values = {str(v or '').upper() for v in values if v}
     return [cur for cur in PREFERRED_CURRENCY_ORDER if cur in values] + sorted(values - set(PREFERRED_CURRENCY_ORDER))
+
+
+def _shopee_sort_key(sd):
+    """같은 통화의 쇼피 PDF가 여러 개일 때 기간순으로 정렬합니다."""
+    return (
+        _date_to_int(sd.get('period_start')) or 0,
+        _date_to_int(sd.get('period_end')) or 0,
+        _date_to_int(sd.get('write_date')) or 0,
+    )
+
+
+def _shopee_items_for_currency(shopee_results, currency):
+    """해당 통화의 쇼피 PDF 결과를 기간순으로 반환합니다."""
+    return sorted(
+        [s for s in (shopee_results or [])
+         if s.get('currency') == currency and _has_shopee_data(s)],
+        key=_shopee_sort_key,
+    )
+
+
+def _base_shopee_sheet_name(currency):
+    return SHOPEE_SHEET_NAMES.get(currency, f'쇼피({currency})')
+
+
+def _shopee_sheet_names_for_results(shopee_results, shopee_currencies):
+    """
+    쇼피 원본 PDF 시트명을 생성합니다.
+    같은 통화의 PDF가 여러 개면 쇼피(MYR)(1), 쇼피(MYR)(2)처럼 번호를 붙입니다.
+    한 개뿐이면 기존처럼 쇼피(MYR)를 유지합니다.
+    """
+    out = []
+    for cur in shopee_currencies:
+        items = _shopee_items_for_currency(shopee_results, cur)
+        base = _base_shopee_sheet_name(cur)
+        if len(items) <= 1:
+            if items:
+                out.append(base)
+        else:
+            out.extend(f'{base}({idx})' for idx, _sd in enumerate(items, 1))
+    return out
 
 
 def _has_shopee_data(sd):
@@ -1102,7 +1166,10 @@ def generate_excel(
             rate = _get_rate(rates, cur, rate_date)
             total_fx  = sd.get('total_amount', 0.0)
             total_krw = round(total_fx * rate / div)
-        shopee_totals[cur] = {'fx': total_fx, 'krw': total_krw}
+        if cur not in shopee_totals:
+            shopee_totals[cur] = {'fx': 0.0, 'krw': 0}
+        shopee_totals[cur]['fx'] += total_fx
+        shopee_totals[cur]['krw'] += total_krw
 
     if lazada_result:
         laz_rate_by_cur = {}
@@ -1139,7 +1206,7 @@ def generate_excel(
         if cur == 'JPY':
             continue
         ws = wb.create_sheet(cur)
-        sd = next((s for s in shopee_results if s.get('currency') == cur and _has_shopee_data(s)), None)
+        sd = _shopee_items_for_currency(shopee_results, cur)
         lazada_items = []
         if _has_lazada_data(lazada_result):
             lazada_items = [it for it in lazada_result.get('items', [])
@@ -1181,13 +1248,15 @@ def generate_excel(
         ws_q10 = wb.create_sheet('큐텐(소포수령증)')
         write_qoo10_sheet(ws_q10, qoo10_result, jpy_rate, submitter=report_submitter)
 
-    # ── 쇼피 국가별 시트
-    # 쇼피 PDF가 있는 통화만 생성합니다.
+    # ── 쇼피 원본 PDF별 시트
+    # 같은 통화의 PDF가 여러 개면 쇼피(MYR)(1), 쇼피(MYR)(2)처럼 기간순으로 분리합니다.
     for cur in shopee_currencies:
-        sheet_name = SHOPEE_SHEET_NAMES.get(cur, f'쇼피({cur})')
-        ws = wb.create_sheet(sheet_name)
-        sd = next((s for s in shopee_results if s.get('currency') == cur and _has_shopee_data(s)), None)
-        write_shopee_sheet(ws, sd, rates, submitter=report_submitter)
+        items = _shopee_items_for_currency(shopee_results, cur)
+        base_sheet_name = _base_shopee_sheet_name(cur)
+        for idx, sd in enumerate(items, 1):
+            sheet_name = f'{base_sheet_name}({idx})' if len(items) > 1 else base_sheet_name
+            ws = wb.create_sheet(sheet_name)
+            write_shopee_sheet(ws, sd, rates, submitter=sd.get('submitter') or report_submitter)
 
     # ── 라자다(소포수령증) + 라자다(국가별)
     # 라자다 PDF가 있을 때만 생성하고, 통화별 라자다 시트도 실제 통화만 생성합니다.
@@ -1215,7 +1284,7 @@ def generate_excel(
     keep_sheets.update(cur for cur in used_currencies if cur != 'JPY')
     if qoo10_used:
         keep_sheets.update({'JPY', '큐텐(소포수령증)'})
-    keep_sheets.update(SHOPEE_SHEET_NAMES.get(cur, f'쇼피({cur})') for cur in shopee_currencies)
+    keep_sheets.update(_shopee_sheet_names_for_results(shopee_results, shopee_currencies))
     if _has_lazada_data(lazada_result):
         keep_sheets.add('라자다(소포수령증)')
         keep_sheets.update(f'라자다({cur})' for cur in lazada_currencies)
