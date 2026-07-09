@@ -17,6 +17,9 @@ from .exchange_rate import get_rate_for_date, avg_rate_for_period
 RATE_DIVISOR = {"JPY": 100, "VND": 100}
 TRACKING_NO_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{13}$", re.I)
 
+# L/C 번호 또는 수출신고번호에는 운송장번호를 넣지 않습니다.
+# 영세율 증빙은 기타영세율건수 1로 신고합니다.
+
 HEADER_FILL = PatternFill("solid", fgColor="D9E1F2")
 THIN_BORDER = Border(
     left=Side(style="thin"), right=Side(style="thin"),
@@ -48,8 +51,8 @@ def is_valid_tracking_no(value):
     return bool(TRACKING_NO_PATTERN.fullmatch(text))
 
 
-def other_zero_rate_count_value(value):
-    return None if is_valid_tracking_no(value) else 1
+def other_zero_rate_count_value(value=None):
+    return 1
 
 
 def _company_name(shopee_results, lazada_result, qoo10_result):
@@ -80,8 +83,9 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates):
             rows.append({
                 "platform": "쇼피",
                 "issuer": tx.get("carrier") or sd.get("carrier") or "주)두라로지스틱스",
-                "export_no": tracking,
-                "other_count": other_zero_rate_count_value(tracking),
+                "tracking_no": tracking,
+                "export_no": "",
+                "other_count": 1,
                 "ship_date": ship_date,
                 "issue_date": ship_date,
                 "currency": cur,
@@ -105,8 +109,9 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates):
             rows.append({
                 "platform": "라자다",
                 "issuer": it.get("carrier") or lazada_result.get("carrier") or "용성종합물류",
-                "export_no": tracking,
-                "other_count": other_zero_rate_count_value(tracking),
+                "tracking_no": tracking,
+                "export_no": "",
+                "other_count": 1,
                 "ship_date": ship_date,
                 "issue_date": ship_date,
                 "currency": cur,
@@ -136,8 +141,9 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates):
             rows.append({
                 "platform": "큐텐",
                 "issuer": qoo10_result.get("carrier", "국제로지스틱"),
-                "export_no": tracking,
-                "other_count": other_zero_rate_count_value(tracking),
+                "tracking_no": tracking,
+                "export_no": "",
+                "other_count": 1,
                 "ship_date": ship_date,
                 "issue_date": ship_date,
                 "currency": "JPY",
@@ -146,7 +152,7 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates):
                 "krw": krw,
             })
 
-    return sorted(rows, key=lambda r: (r.get("ship_date") or 0, r.get("currency") or "", r.get("export_no") or ""))
+    return sorted(rows, key=lambda r: (r.get("ship_date") or 0, r.get("currency") or "", r.get("tracking_no") or ""))
 
 
 def _find_template(base_dir: Path, filename: str) -> Optional[Path]:
@@ -233,7 +239,7 @@ def _write_zero_sheet(ws, rows):
         if idx > start_row:
             _copy_style(ws, start_row, idx, max_col)
         vals = [
-            1, "소포수령증", r["issuer"], r["issue_date"], r["ship_date"], r["export_no"], "",
+            1, "소포수령증", r["issuer"], r["issue_date"], r["ship_date"], "", "",
             r["currency"], r["rate"], r["foreign"], r["krw"], r["foreign"], r["krw"], 0, 0,
         ]
         for c, v in enumerate(vals, 1):

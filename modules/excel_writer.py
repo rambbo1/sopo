@@ -49,16 +49,16 @@ DEFAULT_SUBMITTER = {
 NUM_FMT  = '#,##0'        # 정수(수량·원화)
 NUM_FMT2 = '#,##0.00'     # 소수(외화·환율)
 
-# 운송장번호가 영문 2자리 + 나머지 13자리(총 15자리) 양식이면
-# 수출신고번호가 있는 것으로 보고 기타영세율건수는 공란, 아니면 1로 입력합니다.
+# L/C 번호 또는 수출신고번호에는 운송장번호를 넣지 않습니다.
+# 영세율 증빙은 기타영세율건수 1로 신고합니다.
 TRACKING_NO_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{13}$", re.I)
 
 def is_valid_tracking_no(value):
     text = re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
     return bool(TRACKING_NO_PATTERN.fullmatch(text))
 
-def other_zero_rate_count_value(value):
-    return None if is_valid_tracking_no(value) else 1
+def other_zero_rate_count_value(value=None):
+    return 1
 
 def _date_to_int(value):
     d = re.sub(r"\D", "", str(value or ""))[:8]
@@ -478,7 +478,7 @@ def write_currency_template_sheet(ws, currency: str,
         amount   = float(tx.get('amount', 0) or 0)
         krw      = round(amount * tx_rate / divisor)
         date_int = _date_to_int(tx.get('date', ''))
-        row_vals = [tx.get('tracking_no', ''), other_zero_rate_count_value(tx.get('tracking_no', '')), date_int, currency, tx_rate, amount, krw]
+        row_vals = ['', 1, date_int, currency, tx_rate, amount, krw]
         for col, v in enumerate(row_vals, 1):
             c = ws.cell(row=data_row, column=col, value=v)
             nf = {5: NUM_FMT2, 6: NUM_FMT2, 7: NUM_FMT}.get(col)
@@ -491,7 +491,7 @@ def write_currency_template_sheet(ws, currency: str,
         
         tracking_no = it.get('tracking_no', '')
         date_int_laz = _date_to_int(lazada_write_date)
-        row_vals = [tracking_no, other_zero_rate_count_value(tracking_no), date_int_laz, currency, lazada_rate, it['amount'], krw]
+        row_vals = ['', 1, date_int_laz, currency, lazada_rate, it['amount'], krw]
         for col, v in enumerate(row_vals, 1):
             c = ws.cell(row=data_row, column=col, value=v)
             nf = {5: NUM_FMT2, 6: NUM_FMT2, 7: NUM_FMT}.get(col)
@@ -1235,8 +1235,8 @@ def generate_excel(
                 except ValueError:
                     date_str = ''
             tracking = e.get('tracking_no') or qoo10_result.get('tracking_no', '')
-            ws_jpy.cell(row=_jr, column=1, value=tracking)
-            ws_jpy.cell(row=_jr, column=2, value=other_zero_rate_count_value(tracking))
+            ws_jpy.cell(row=_jr, column=1, value='')
+            ws_jpy.cell(row=_jr, column=2, value=1)
             ws_jpy.cell(row=_jr, column=3, value=date_str or None)
             ws_jpy.cell(row=_jr, column=4, value='JPY')
             ws_jpy.cell(row=_jr, column=5, value=e.get('rate', jpy_rate)).number_format = NUM_FMT2
