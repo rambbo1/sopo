@@ -688,48 +688,67 @@ def fill_missing_dates(rate_df, start_date=None, end_date=None):
     return filled
 
 
-def _to_rate_entry(currency, raw_df, start_date, end_date):
-    if raw_df is None or raw_df.empty:
-        return {
-            "period": f"{pd.to_datetime(start_date).strftime('%Y.%m.%d')} ~ {pd.to_datetime(end_date).strftime('%Y.%m.%d')}",
-            "currency": currency,
-            "currency_name": CURRENCY_NAMES.get(currency, currency),
-            "average": 0.0,
-            "min": 0.0,
-            "min_date": "",
-            "max": 0.0,
-            "max_date": "",
-            "range": 0.0,
-            "cross_rate": 0.0,
-            "daily": [],
-        }
-    filled = fill_missing_dates(raw_df, start_date, end_date)
-    vals = [float(x) for x in filled["rate"].dropna().tolist()]
-    min_idx = filled["rate"].idxmin() if vals else None
-    max_idx = filled["rate"].idxmax() if vals else None
-    daily = []
-    prev = None
-    for _, r in filled.iterrows():
-        rate = float(r["rate"])
-        change = 0.0 if prev is None else round(rate - prev, 6)
-        daily.append({"date": pd.to_datetime(r["date"]).strftime("%Y.%m.%d"), "rate": rate, "change": change, "cross": 0})
-        prev = rate
-    return {
-        "period": f"{pd.to_datetime(start_date).strftime('%Y.%m.%d')} ~ {pd.to_datetime(end_date).strftime('%Y.%m.%d')}",
+def _to_rate_entry(currency, raw_df, start_date, end_date, display_start=None, display_end=None):
+    fetch_start = pd.to_datetime(start_date).normalize()
+    fetch_end = pd.to_datetime(end_date).normalize()
+    display_start = pd.to_datetime(display_start if display_start is not None else fetch_start).normalize()
+    display_end = pd.to_datetime(display_end if display_end is not None else fetch_end).normalize()
+    if display_end < display_start:
+        display_start, display_end = display_end, display_start
+
+    empty = {
+        "period": f"{display_start.strftime('%Y.%m.%d')} ~ {display_end.strftime('%Y.%m.%d')}",
+        "display_start": display_start.strftime("%Y.%m.%d"),
+        "display_end": display_end.strftime("%Y.%m.%d"),
         "currency": currency,
         "currency_name": CURRENCY_NAMES.get(currency, currency),
-        "average": round(sum(vals) / len(vals), 4) if vals else 0.0,
-        "min": min(vals) if vals else 0.0,
-        "min_date": pd.to_datetime(filled.loc[min_idx, "date"]).strftime("%Y.%m.%d") if min_idx is not None else "",
-        "max": max(vals) if vals else 0.0,
-        "max_date": pd.to_datetime(filled.loc[max_idx, "date"]).strftime("%Y.%m.%d") if max_idx is not None else "",
-        "range": round(max(vals) - min(vals), 4) if vals else 0.0,
+        "average": 0.0,
+        "min": 0.0,
+        "min_date": "",
+        "max": 0.0,
+        "max_date": "",
+        "range": 0.0,
         "cross_rate": 0.0,
+        "daily": [],
+    }
+    if raw_df is None or raw_df.empty:
+        return empty
+
+    # 내부 계산용으로는 직전 영업일을 포함한 수집기간 전체를 보관합니다.
+    filled = fill_missing_dates(raw_df, fetch_start, fetch_end)
+    stats = filled[(filled["date"] >= display_start) & (filled["date"] <= display_end)].copy()
+    if stats.empty:
+        stats = filled.copy()
+
+    vals = [float(x) for x in stats["rate"].dropna().tolist()]
+    min_idx = stats["rate"].idxmin() if vals else None
+    max_idx = stats["rate"].idxmax() if vals else None
+    daily = []
+    prev = None
+    for _, row in filled.iterrows():
+        rate = float(row["rate"])
+        change = 0.0 if prev is None else round(rate - prev, 6)
+        daily.append({
+            "date": pd.to_datetime(row["date"]).strftime("%Y.%m.%d"),
+            "rate": rate,
+            "change": change,
+            "cross": 0,
+        })
+        prev = rate
+
+    return {
+        **empty,
+        "average": round(sum(vals) / len(vals), 2) if vals else 0.0,
+        "min": round(min(vals), 2) if vals else 0.0,
+        "min_date": pd.to_datetime(stats.loc[min_idx, "date"]).strftime("%Y.%m.%d") if min_idx is not None else "",
+        "max": round(max(vals), 2) if vals else 0.0,
+        "max_date": pd.to_datetime(stats.loc[max_idx, "date"]).strftime("%Y.%m.%d") if max_idx is not None else "",
+        "range": round(max(vals) - min(vals), 2) if vals else 0.0,
         "daily": daily,
     }
 
 
-def fetch_all_currencies_for_period(start_date, end_date, currencies: Iterable[str], logger: Optional[Callable[[str], None]] = None):
+def fetch_all_currencies_for_period(start_date, end_date, currencies: Iterable[str], logger: Optional[Callable[[str], None]] = None, display_start=None, display_end=None):
     previous_logger = _LOGGER
     set_logger(logger or previous_logger)
     try:
@@ -741,7 +760,7 @@ def fetch_all_currencies_for_period(start_date, end_date, currencies: Iterable[s
             _log(f"💱 환율 수집 중... ({', '.join(used)})")
         for cur in used:
             raw = get_cached_or_fetch_smbs_period_rates(cur, start_date, end_date)
-            out[cur] = _to_rate_entry(cur, raw, start_date, end_date)
+            out[cur] = _to_rate_entry(cur, raw, start_date, end_date, display_start=display_start, display_end=display_end)
         if used:
             _log("✅ 환율 수집 완료")
         return out
@@ -750,9 +769,12 @@ def fetch_all_currencies_for_period(start_date, end_date, currencies: Iterable[s
 
 
 def fetch_all_currencies(year: int, month: int, currencies: Iterable[str]):
-    last = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
-    first = pd.Timestamp(year=year, month=month, day=1) - pd.Timedelta(days=RATE_LOOKBACK_DAYS)
-    return fetch_all_currencies_for_period(first, last, currencies)
+    display_start = pd.Timestamp(year=year, month=month, day=1)
+    last = display_start + pd.offsets.MonthEnd(0)
+    first = display_start - pd.Timedelta(days=RATE_LOOKBACK_DAYS)
+    return fetch_all_currencies_for_period(
+        first, last, currencies, display_start=display_start, display_end=last
+    )
 
 
 
@@ -838,7 +860,7 @@ def avg_rate_for_period(rate_data: dict, start: str, end: str) -> float:
     right = bisect.bisect_right(dates, e)
     vals = [r for r in rates[left:right] if r and r > 0]
     if vals:
-        return round(sum(vals) / len(vals), 4)
+        return round(sum(vals) / len(vals), 2)
     return get_rate_for_date(rate_data, e) or float(rate_data.get("average", 0.0) or 0.0)
 
 
@@ -1322,12 +1344,12 @@ def _to_month_rate_entry(currency, raw_df, start_month, end_month):
         "period": f"{months[0] if months else ''} ~ {months[-1] if months else ''}",
         "currency": currency,
         "currency_name": CURRENCY_NAMES.get(currency, currency),
-        "average": round(sum(vals) / len(vals), 4) if vals else 0.0,
+        "average": round(sum(vals) / len(vals), 2) if vals else 0.0,
         "min": min(vals) if vals else 0.0,
         "max": max(vals) if vals else 0.0,
         "min_date": "",
         "max_date": "",
-        "range": round(max(vals) - min(vals), 4) if vals else 0.0,
+        "range": round(max(vals) - min(vals), 2) if vals else 0.0,
         "cross_rate": 0.0,
         "daily": [],
         "monthly": monthly,
@@ -1373,7 +1395,7 @@ def monthly_avg_rate_for_month(rate_data: dict, month_key: str) -> float:
         if parse_month_key(row.get("year_month")) == mk:
             rate = float(row.get("rate") or 0.0)
             if rate > 0:
-                return rate
+                return round(rate, 2)
     raise RuntimeError(
         f"서울외국환중개 공식 월평균 매매기준율이 없습니다: {mk}. "
         "일별 환율 평균으로 대체하지 않습니다."

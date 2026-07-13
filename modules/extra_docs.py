@@ -68,6 +68,10 @@ def _company_name(shopee_results, lazada_result, qoo10_result, ebay_results=None
         sub = er.get("submitter") or {}
         if sub.get("name"):
             return sub.get("name")
+    if qoo10_result:
+        sub = qoo10_result.get("submitter") or {}
+        if sub.get("name"):
+            return sub.get("name")
     return "회사이름"
 
 

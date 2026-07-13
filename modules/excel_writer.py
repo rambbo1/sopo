@@ -196,10 +196,13 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
             c = ws.cell(row=4, column=col, value=h)
             _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
         for r, d in enumerate(rate_data.get('monthly', []), 5):
-            vals = [d.get('year_month', ''), rate_data.get('currency_name', ''), d.get('rate', 0)]
+            vals = [d.get('year_month', ''), rate_data.get('currency_name', ''), round(float(d.get('rate', 0) or 0), 2)]
             for col, v in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col, value=v)
-                _style(c, font=FONT_DEFAULT, align=CENTER if col != 2 else LEFT, border=THIN_BORDER)
+                _style(
+                    c, font=FONT_DEFAULT, align=CENTER if col != 2 else LEFT, border=THIN_BORDER,
+                    num_format=NUM_FMT2 if col == 3 else None,
+                )
         return
 
     # 제목
@@ -227,7 +230,10 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
     ]
     for col, v in enumerate(vals6, 1):
         c = ws.cell(row=6, column=col, value=v)
-        _style(c, font=FONT_DEFAULT, align=CENTER, border=THIN_BORDER)
+        _style(
+            c, font=FONT_DEFAULT, align=CENTER, border=THIN_BORDER,
+            num_format=NUM_FMT2 if col in (1, 2, 4, 6, 7) and isinstance(v, (int, float)) else None,
+        )
 
     # 일별
     ws['A7'] = '일별 매매기준율'
@@ -238,11 +244,22 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
         c = ws.cell(row=9, column=col, value=h)
         _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
 
-    for r, d in enumerate(rate_data.get('daily', []), 10):
+    daily_rows = list(rate_data.get('daily', []))
+    display_start = str(rate_data.get('display_start', '') or '')
+    display_end = str(rate_data.get('display_end', '') or '')
+    if display_start:
+        daily_rows = [d for d in daily_rows if str(d.get('date', '')) >= display_start]
+    if display_end:
+        daily_rows = [d for d in daily_rows if str(d.get('date', '')) <= display_end]
+
+    for r, d in enumerate(daily_rows, 10):
         vals = [d['date'], rate_data.get('currency_name', ''), d['rate'], d['change'], d['cross']]
         for col, v in enumerate(vals, 1):
             c = ws.cell(row=r, column=col, value=v)
-            _style(c, font=FONT_DEFAULT, align=CENTER if col != 2 else LEFT, border=THIN_BORDER)
+            _style(
+                c, font=FONT_DEFAULT, align=CENTER if col != 2 else LEFT, border=THIN_BORDER,
+                num_format=NUM_FMT2 if col in (3, 4) else None,
+            )
 
 
 # ── 쇼피 소포수령증 시트 작성 ───────────────────────────────────
@@ -1336,6 +1353,8 @@ def generate_excel(
             if er.get('submitter') and er['submitter'].get('name'):
                 report_submitter = er['submitter']
                 break
+    if report_submitter is None and qoo10_result and qoo10_result.get('submitter', {}).get('name'):
+        report_submitter = qoo10_result['submitter']
     if report_submitter is None:
         report_submitter = DEFAULT_SUBMITTER
 

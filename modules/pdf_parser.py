@@ -2,7 +2,7 @@
 소포수령증 PDF 파싱 모듈
 - 쇼피(Shopee): 두라로지스틱스, 텍스트 기반 PDF
 - 라자다(Lazada): 용성종합물류, 텍스트 기반 PDF (요약)
-- 큐텐(Qoo10): 국제로지스틱, 이미지 기반 PDF → OCR 자동 추출
+- 큐텐(Qoo10): 국제로지스틱, 표/텍스트 우선 + OCR 보완 자동 추출
 """
 
 import pdfplumber
@@ -42,23 +42,66 @@ SHOPEE_FILE_PATTERNS = {
 }
 
 
+def _detect_pdf_type_from_text(text: str) -> str:
+    """PDF 본문 표식으로 플랫폼을 판별합니다."""
+    raw = str(text or "")
+    compact = re.sub(r"\s+", "", raw).lower()
+
+    # 큐텐/국제로지스틱 양식: 판매처 Qoo10 + JPY 금액표가 핵심 표식입니다.
+    if ("qoo10" in compact and "국제로지스틱" in compact) or (
+        "금액(jpy)" in compact and "국제로지스틱" in compact
+    ):
+        return "qoo10"
+
+    # 이베이/린코스 양식은 발행월별 내역과 린코스 배송사 표식이 함께 있습니다.
+    if "린코스" in compact or "lincos" in compact:
+        return "ebay"
+
+    if "라자다" in compact or "lazada" in compact or "용성종합물류" in compact:
+        return "lazada"
+
+    # 쇼피/두라로지스틱스 양식은 상세 운송장 내역이 존재합니다.
+    if "두라로지스틱스" in compact and ("운송장번호" in compact or "수출신고금액" in compact):
+        return "shopee"
+
+    return "unknown"
+
+
+def _extract_pdf_text_for_detection(pdf_path: str, max_pages: int = 2) -> str:
+    try:
+        path = Path(pdf_path)
+        if not path.exists() or not path.is_file():
+            return ""
+        texts = []
+        with pdfplumber.open(str(path)) as pdf:
+            for page in pdf.pages[:max_pages]:
+                text = page.extract_text()
+                if text:
+                    texts.append(text)
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
 def detect_pdf_type(pdf_path: str) -> str:
-    """파일명으로 소포수령증 종류 판단 → 'shopee' | 'lazada' | 'qoo10' | 'ebay' | 'unknown'"""
-    name = Path(pdf_path).name
+    """파일명과 PDF 본문으로 종류 판단 -> shopee/lazada/qoo10/ebay/unknown."""
+    name = Path(str(pdf_path)).name
     lower = name.lower()
-    if '라자다' in name or 'lazada' in lower:
-        return 'lazada'
-    if '큐텐' in name or 'qoo10' in lower:
-        return 'qoo10'
-    if '이베이' in name or 'ebay' in lower or '린코스' in name or 'lincos' in lower or '해외소포수령증' in name:
-        return 'ebay'
+    if "라자다" in name or "lazada" in lower:
+        return "lazada"
+    if "큐텐" in name or "qoo10" in lower:
+        return "qoo10"
+    if "이베이" in name or "ebay" in lower or "린코스" in name or "lincos" in lower:
+        return "ebay"
     # 쇼피: 업체명과 무관하게 파일명의 국가코드 패턴(_MY_, _TW_ 등)으로 인식
-    if re.search(r'_(MY|PH|SG|TH|TW|VN|BR|MX|JP)_', name):
-        return 'shopee'
-    # 기존 호환: 유엠 키워드
-    if '유엠(UM)_' in name or '유엠_' in name:
-        return 'shopee'
-    return 'unknown'
+    if re.search(r"_(MY|PH|SG|TH|TW|VN|BR|MX|JP)_", name):
+        return "shopee"
+    if "유엠(UM)_" in name or "유엠_" in name:
+        return "shopee"
+
+    # 파일명이 일반적인 경우에는 본문 표식을 확인합니다.
+    content_type = _detect_pdf_type_from_text(_extract_pdf_text_for_detection(str(pdf_path)))
+    return content_type
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -564,105 +607,209 @@ def _ocr_pdf(pdf_path: str) -> str:
         return ''
 
 
-def parse_qoo10_pdf(pdf_path: str) -> Optional[dict]:
-    """
-    큐텐재팬 소포수령증 파싱
-    이미지 기반 PDF → OCR로 자동 추출 시도
-    OCR 실패 시 None 반환 (수동 입력 필요)
-    """
-    # 먼저 pdfplumber로 텍스트 추출 시도
-    all_text = ''
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                all_text += t + '\n'
+def _clean_tracking_no(value: str) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    m = re.search(r"[Kk]\d{13,}", text)
+    return m.group(0).upper() if m else ""
 
-    # 텍스트 없으면 OCR 시도
-    if not all_text.strip():
-        print("  🔍 큐텐 PDF 이미지 기반 → OCR 시도...")
-        all_text = _ocr_pdf(pdf_path)
 
-    if not all_text.strip():
-        print("  ⚠️  큐텐 PDF 텍스트 추출 실패 — 수동 입력 필요")
-        return None
-
-    # ── 거래기간 파싱 ──
-    # 패턴: "2025/12/01 ~ 2025/12/31" 또는 "2025-12-01 ~ 2025-12-31"
-    period_match = re.search(
-        r'(\d{4})[/.\-](\d{2})[/.\-](\d{2})\s*[~–\-]\s*(\d{4})[/.\-](\d{2})[/.\-](\d{2})',
-        all_text
-    )
-    period_start = ''
-    period_end   = ''
-    if period_match:
-        period_start = f"{period_match.group(1)}-{period_match.group(2)}-{period_match.group(3)}"
-        period_end   = f"{period_match.group(4)}-{period_match.group(5)}-{period_match.group(6)}"
-
-    # ── 작성일자 ──
-    # 패턴: "2026-01-05 16:17:50"
-    write_match = re.search(r'(\d{4})[-/.](\d{2})[-/.](\d{2})\s+\d{2}:\d{2}:\d{2}', all_text)
-    write_date = ''
-    if write_match:
-        write_date = f"{write_match.group(1)}-{write_match.group(2)}-{write_match.group(3)}"
-
-    # ── 발송수량 + 금액 ──
-    # OCR 결과 예시: "| S7| HHS Sal 386 2 3,802,685"
-    #   386 = 발송수량, 2 = '건'의 OCR 오인식, 3,802,685 = JPY 금액
-    qty    = 0
+def _parse_qoo10_tables(pdf_path: str) -> dict:
+    """텍스트형 큐텐 소포수령증의 표를 우선 파싱합니다."""
+    submitter = {"name": "", "biz_no": "", "ceo": "", "address": ""}
+    period_start = ""
+    period_end = ""
+    write_date = ""
+    carrier = "국제로지스틱"
+    tracking_no = ""
+    qty = 0
     amount = 0.0
 
-    # 패턴 1: "N (단일문자) large_amount" — 가장 일반적인 OCR 오인식 형태
-    # 예: "386 2 3,802,685" 또는 "386 H 3,802,685"
-    m1 = re.search(r'\b(\d{2,4})\s+[2H건a-zA-Z]\s+([\d,]{5,})\b', all_text)
-    if m1:
-        qty    = int(m1.group(1).replace(',', ''))
-        amount = float(m1.group(2).replace(',', ''))
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                for table in page.extract_tables() or []:
+                    if not table:
+                        continue
+                    normalized = [[str(c or "").strip() for c in row] for row in table if row]
+                    table_text = " ".join(c for row in normalized for c in row)
 
-    # 패턴 2: "N건 amount" (정상 OCR된 경우)
-    if qty == 0:
-        m2 = re.search(r'([\d,]+)\s*건\s+([\d,]+)', all_text)
-        if m2:
-            qty    = int(m2.group(1).replace(',', ''))
-            amount = float(m2.group(2).replace(',', ''))
+                    # 1. 제출자 인적사항
+                    if "사업자 등록번호" in table_text and "거래기간" in table_text:
+                        for row in normalized:
+                            for i, cell in enumerate(row):
+                                if "사업자 등록번호" in cell and i + 1 < len(row):
+                                    submitter["biz_no"] = row[i + 1]
+                                elif "상호" in cell and i + 1 < len(row):
+                                    submitter["name"] = row[i + 1]
+                                elif "성명" in cell and i + 1 < len(row):
+                                    submitter["ceo"] = row[i + 1]
+                                elif "사업장 소재지" in cell and i + 1 < len(row):
+                                    submitter["address"] = row[i + 1].replace("\n", " ")
+                                elif "거래기간" in cell and i + 1 < len(row):
+                                    raw = row[i + 1]
+                                    m = re.search(
+                                        r"(\d{4})[/.-](\d{2})[/.-](\d{2})\s*[~–-]\s*"
+                                        r"(\d{4})[/.-](\d{2})[/.-](\d{2})",
+                                        raw,
+                                    )
+                                    if m:
+                                        period_start = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                                        period_end = f"{m.group(4)}-{m.group(5)}-{m.group(6)}"
+                                elif "작성일자" in cell and i + 1 < len(row):
+                                    m = re.search(r"(\d{4})[-/.](\d{2})[-/.](\d{2})", row[i + 1])
+                                    if m:
+                                        write_date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
-    # 패턴 3: | N | amount | 파이프로 구분된 표 형식
-    if qty == 0:
-        m3 = re.search(r'[\|｜]\s*([\d,]{2,4})\s*[\|｜]\s*([\d,]{5,})', all_text)
-        if m3:
-            qty    = int(m3.group(1).replace(',', ''))
-            amount = float(m3.group(2).replace(',', ''))
-
-    # 패턴 4: 큰 숫자(6자리+) 앞의 3~4자리 숫자 = qty, 큰 숫자 = amount
-    if qty == 0:
-        m4 = re.search(r'\b(\d{3,4})\s+\d\s+([\d,]{5,})', all_text)
-        if m4:
-            qty    = int(m4.group(1).replace(',', ''))
-            amount = float(m4.group(2).replace(',', ''))
-
-    # ── 추적번호 ──
-    tracking_match = re.search(r'[Kk]\d{13,}', all_text)
-    tracking_no = tracking_match.group(0) if tracking_match else ''
-
-    # 주요 데이터 추출 성공 여부
-    if qty == 0 and amount == 0.0:
-        print(f"  ⚠️  큐텐 OCR 성공했으나 수량/금액 파싱 실패 — 수동 입력 필요")
-        print(f"      OCR 텍스트 (일부): {all_text[:300]}")
-        return None
-
-    print(f"  ✅ 큐텐 OCR 성공 — 기간:{period_start}~{period_end} 수량:{qty}건 JPY:{amount:,.0f}")
+                    # 3. 해외배송 내역서 상세/합계 행
+                    if "금액(JPY)" in table_text and ("발송수량" in table_text or "해외배송업체" in table_text):
+                        header_idx = None
+                        for idx, row in enumerate(normalized):
+                            if any("금액(JPY)" in c for c in row):
+                                header_idx = idx
+                                break
+                        if header_idx is not None:
+                            headers = normalized[header_idx]
+                            def _idx(keyword):
+                                return next((i for i, c in enumerate(headers) if keyword in c), None)
+                            i_carrier = _idx("해외배송업체")
+                            i_track = _idx("발송번호")
+                            i_qty = _idx("발송수량")
+                            i_amt = _idx("금액(JPY)")
+                            for row in normalized[header_idx + 1:]:
+                                if not row or "당기 해외배송 합계" in " ".join(row):
+                                    continue
+                                if i_carrier is not None and i_carrier < len(row) and row[i_carrier]:
+                                    carrier = row[i_carrier]
+                                if i_track is not None and i_track < len(row):
+                                    tracking_no = _clean_tracking_no(row[i_track]) or tracking_no
+                                if i_qty is not None and i_qty < len(row):
+                                    m = re.search(r"[\d,]+", row[i_qty])
+                                    if m:
+                                        qty = int(m.group(0).replace(",", ""))
+                                if i_amt is not None and i_amt < len(row):
+                                    m = re.search(r"[\d,]+(?:\.\d+)?", row[i_amt])
+                                    if m:
+                                        amount = float(m.group(0).replace(",", ""))
+                                if qty or amount:
+                                    break
+    except Exception:
+        pass
 
     return {
-        'type':         'qoo10',
-        'carrier':      '국제로지스틱',
-        'destination':  'JP',
-        'currency':     'JPY',
-        'period_start': period_start,
-        'period_end':   period_end,
-        'write_date':   write_date,
-        'qty':          qty,
-        'amount':       float(amount),
-        'tracking_no':  tracking_no,
+        "submitter": submitter,
+        "carrier": carrier,
+        "period_start": period_start,
+        "period_end": period_end,
+        "write_date": write_date,
+        "qty": qty,
+        "amount": amount,
+        "tracking_no": tracking_no,
+    }
+
+
+def parse_qoo10_pdf(pdf_path: str) -> Optional[dict]:
+    """큐텐재팬 소포수령증을 표 우선, 텍스트/OCR 보완 방식으로 파싱합니다."""
+    table_data = _parse_qoo10_tables(pdf_path)
+
+    # pdfplumber 텍스트 추출
+    all_text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                all_text += text + "\n"
+
+    # 이미지 PDF면 OCR 보완
+    if not all_text.strip():
+        print("  큐텐 PDF 이미지 기반 -> OCR 시도...")
+        all_text = _ocr_pdf(pdf_path)
+    if not all_text.strip() and not (table_data.get("qty") or table_data.get("amount")):
+        print("  큐텐 PDF 텍스트 추출 실패 - 수동 입력 필요")
+        return None
+
+    period_start = table_data.get("period_start", "")
+    period_end = table_data.get("period_end", "")
+    if not period_start or not period_end:
+        m = re.search(
+            r"(\d{4})[/.-](\d{2})[/.-](\d{2})\s*[~–-]\s*"
+            r"(\d{4})[/.-](\d{2})[/.-](\d{2})",
+            all_text,
+        )
+        if m:
+            period_start = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            period_end = f"{m.group(4)}-{m.group(5)}-{m.group(6)}"
+
+    write_date = table_data.get("write_date", "")
+    if not write_date:
+        m = re.search(r"(\d{4})[-/.](\d{2})[-/.](\d{2})(?:\s+\d{2}:\d{2}:\d{2})?", all_text)
+        if m:
+            # 거래기간 첫 날짜가 아니라 작성일자 표식 뒤의 날짜를 우선 재탐색
+            wm = re.search(r"작성일자\s+(\d{4})[-/.](\d{2})[-/.](\d{2})", all_text)
+            src = wm or m
+            write_date = f"{src.group(1)}-{src.group(2)}-{src.group(3)}"
+
+    qty = int(table_data.get("qty", 0) or 0)
+    amount = float(table_data.get("amount", 0) or 0)
+
+    # 정상 텍스트 표: 상세 행 또는 합계 행의 '23 건 74,170'
+    if qty == 0 or amount == 0:
+        candidates = re.findall(r"([\d,]+)\s*건\s+([\d,]+(?:\.\d+)?)", all_text)
+        if candidates:
+            q, a = candidates[-1]
+            qty = qty or int(q.replace(",", ""))
+            amount = amount or float(a.replace(",", ""))
+
+    # OCR 보완 패턴
+    if qty == 0 or amount == 0:
+        patterns = [
+            r"\b(\d{2,4})\s+[2H건a-zA-Z]\s+([\d,]{5,})\b",
+            r"[|｜]\s*([\d,]{2,4})\s*[|｜]\s*([\d,]{5,})",
+            r"\b(\d{3,4})\s+\d\s+([\d,]{5,})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, all_text)
+            if m:
+                qty = qty or int(m.group(1).replace(",", ""))
+                amount = amount or float(m.group(2).replace(",", ""))
+                break
+
+    tracking_no = table_data.get("tracking_no", "") or _clean_tracking_no(all_text)
+
+    submitter = table_data.get("submitter") or {"name": "", "biz_no": "", "ceo": "", "address": ""}
+    if not submitter.get("biz_no"):
+        m = re.search(r"사업자\s*등록번호\s+(\d{3}-\d{2}-\d{5})", all_text)
+        if m:
+            submitter["biz_no"] = m.group(1)
+    if not submitter.get("name"):
+        m = re.search(r"상호\s*\(법인명\)\s+(.+?)(?:\s+성명\s*\(대표자\)|$)", all_text)
+        if m:
+            submitter["name"] = m.group(1).strip()
+    if not submitter.get("ceo"):
+        m = re.search(r"성명\s*\(대표자\)\s+(\S+)", all_text)
+        if m:
+            submitter["ceo"] = m.group(1).strip()
+    if not submitter.get("address"):
+        m = re.search(r"사업장\s*소재지\s+(.+?)(?:\n|거래기간)", all_text)
+        if m:
+            submitter["address"] = m.group(1).strip()
+
+    if qty == 0 and amount == 0.0:
+        print("  큐텐 PDF 수량/금액 파싱 실패 - STEP 2에서 직접 입력 필요")
+        return None
+
+    print(f"  큐텐 PDF 자동인식 - 기간:{period_start}~{period_end} 수량:{qty}건 JPY:{amount:,.0f}")
+    return {
+        "type": "qoo10",
+        "submitter": submitter,
+        "carrier": table_data.get("carrier") or "국제로지스틱",
+        "destination": "JP",
+        "currency": "JPY",
+        "period_start": period_start,
+        "period_end": period_end,
+        "write_date": write_date,
+        "qty": qty,
+        "amount": float(amount),
+        "tracking_no": tracking_no,
     }
 
 
