@@ -24,7 +24,12 @@ sys.path.insert(0, str(BASE_DIR))
 
 from modules.pdf_parser import parse_pdf, detect_pdf_type
 from modules.excel_writer import generate_excel, period_labels
-from modules.exchange_rate import fetch_all_currencies_for_period, RATE_LOOKBACK_DAYS
+from modules.exchange_rate import (
+    fetch_all_currencies_for_period,
+    fetch_monthly_avg_currencies_for_period,
+    merge_monthly_rates,
+    RATE_LOOKBACK_DAYS,
+)
 from modules.extra_docs import (
     build_declaration_rows,
     company_name_from_results,
@@ -33,7 +38,7 @@ from modules.extra_docs import (
     safe_filename,
 )
 
-CURRENCIES = ["MYR", "PHP", "SGD", "THB", "TWD", "VND", "JPY", "BRL", "MXN"]
+CURRENCIES = ["MYR", "PHP", "SGD", "THB", "TWD", "VND", "JPY", "BRL", "MXN", "USD", "EUR", "GBP", "CAD", "AUD"]
 
 # ── 선택적 로그인: Streamlit secrets [auth]가 있을 때만 사용 ────────────
 ALLOWED_EMAILS = [
@@ -116,6 +121,16 @@ if "qoo10_entries" not in st.session_state:
 if "result_files" not in st.session_state:
     st.session_state.result_files = []
 
+# 파일명으로 구분되지 않는 PDF에만 직접 선택 항목을 표시합니다.
+# 일반 화면의 문구와 배치는 v38과 동일하게 유지합니다.
+UNKNOWN_PDF_TYPE_OPTIONS = ["쇼피", "라자다", "큐텐재팬", "이베이"]
+UNKNOWN_PDF_TYPE_TO_CODE = {
+    "쇼피": "shopee",
+    "라자다": "lazada",
+    "큐텐재팬": "qoo10",
+    "이베이": "ebay",
+}
+
 # ══════════════════════════════════════════════════════════════════
 # STEP 1 — PDF 업로드
 # ══════════════════════════════════════════════════════════════════
@@ -136,13 +151,25 @@ uploaded_files = st.file_uploader(
     key=f"pdf_uploader_{st.session_state.uploader_key}",
 )
 
+uploaded_type_choices = {}
 if uploaded_files:
     cols = st.columns(2)
     for i, f in enumerate(uploaded_files):
         ptype = detect_pdf_type(f.name)
-        icon = {"shopee": "🛍️", "lazada": "🟠", "qoo10": "🇯🇵", "unknown": "❓"}.get(ptype, "📄")
-        label = {"shopee": "쇼피", "lazada": "라자다", "qoo10": "큐텐재팬", "unknown": "미확인"}.get(ptype, "")
-        cols[i % 2].markdown(f"{icon} `{f.name}` — {label}")
+        icon = {"shopee": "🛍️", "lazada": "🟠", "qoo10": "🇯🇵", "ebay": "🛒", "unknown": "❓"}.get(ptype, "📄")
+        label = {"shopee": "쇼피", "lazada": "라자다", "qoo10": "큐텐재팬", "ebay": "이베이", "unknown": "미확인"}.get(ptype, "")
+        target_col = cols[i % 2]
+        target_col.markdown(f"{icon} `{f.name}` — {label}")
+        if ptype == "unknown":
+            selected_label = target_col.selectbox(
+                "문서 종류",
+                UNKNOWN_PDF_TYPE_OPTIONS,
+                key=f"pdf_type_{st.session_state.uploader_key}_{i}_{f.name}",
+                label_visibility="collapsed",
+            )
+            uploaded_type_choices[f.name] = UNKNOWN_PDF_TYPE_TO_CODE[selected_label]
+        else:
+            uploaded_type_choices[f.name] = ptype
 
 st.divider()
 
@@ -261,6 +288,25 @@ def _needed_currencies(shopee_results, lazada_result, qoo10_result):
     return sorted(used)
 
 
+
+def _needed_monthly_currencies(ebay_results):
+    used = set()
+    for er in ebay_results or []:
+        for it in er.get("items", []):
+            if it.get("currency"):
+                used.add(it["currency"])
+    return sorted(used)
+
+
+def _month_values_for_monthly_rates(ebay_results):
+    months = []
+    for er in ebay_results or []:
+        for it in er.get("items", []):
+            month_value = str(it.get("month", "")).strip()
+            if re.fullmatch(r"20\d{2}-\d{2}", month_value):
+                months.append(month_value)
+    return sorted(set(months))
+
 def _date_values_for_rates(shopee_results, lazada_result, qoo10_result):
     values = []
     for sd in shopee_results or []:
@@ -337,14 +383,18 @@ if process_btn:
             log("📄 PDF 분석 중...")
             shopee_results = []
             lazada_result = None
+            ebay_results = []
             for p in pdf_paths:
+                selected_type = uploaded_type_choices.get(p.name, detect_pdf_type(p.name))
+                forced_type = selected_type if detect_pdf_type(p.name) == "unknown" else None
+                detected_type = forced_type or detect_pdf_type(p.name)
                 # 큐텐은 STEP 2 수동 입력을 사용하므로 PDF OCR은 생략합니다.
-                if detect_pdf_type(p.name) == "qoo10":
+                if detected_type == "qoo10":
                     log(f"[SKIP] 큐텐재팬 PDF: {p.name} / STEP 2 수동 입력 사용")
                     continue
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
-                    result = parse_pdf(str(p))
+                    result = parse_pdf(str(p), forced_type=forced_type)
                 if not result:
                     log(f"[WARN] 파싱 실패 또는 미확인: {p.name}")
                     continue
@@ -354,17 +404,21 @@ if process_btn:
                 elif result.get("type") == "lazada":
                     lazada_result = result
                     log(f"[OK] 라자다: {p.name} / {len(result.get('items', [])):,}건")
+                elif result.get("type") == "ebay":
+                    ebay_results.append(result)
+                    log(f"[OK] 이베이: {p.name} / {len(result.get('items', [])):,}건")
 
             qoo10_result = _build_qoo10_result()
             if qoo10_result:
                 log(f"[OK] 큐텐 수동 입력: {len(qoo10_result.get('entries', [])):,}건 / {int(qoo10_result.get('amount',0)):,} JPY")
 
-            if not shopee_results and not lazada_result and not qoo10_result:
+            if not shopee_results and not lazada_result and not qoo10_result and not ebay_results:
                 raise RuntimeError("처리할 데이터가 없습니다. PDF 또는 큐텐 수동 입력을 확인해 주세요.")
             log(f"✅ PDF 분석 완료 ({time.perf_counter() - t_pdf:.1f}초)")
 
             # 환율 수집
-            needed = _needed_currencies(shopee_results, lazada_result, qoo10_result)
+            daily_needed = _needed_currencies(shopee_results, lazada_result, qoo10_result)
+            monthly_needed = _needed_monthly_currencies(ebay_results)
             date_values = _date_values_for_rates(shopee_results, lazada_result, qoo10_result)
             if not date_values:
                 today = pd.Timestamp.today().normalize()
@@ -376,15 +430,23 @@ if process_btn:
 
             t_rate = time.perf_counter()
             progress_bar.progress(45, text="💱 환율 확인 중...")
-            rates = fetch_all_currencies_for_period(rate_start, rate_end, needed, logger=log)
+            rates = {}
+            if daily_needed:
+                rates = fetch_all_currencies_for_period(rate_start, rate_end, daily_needed, logger=log)
+            months_needed = _month_values_for_monthly_rates(ebay_results)
+            if monthly_needed and months_needed:
+                monthly_rates = fetch_monthly_avg_currencies_for_period(
+                    months_needed[0], months_needed[-1], monthly_needed, logger=log
+                )
+                rates = merge_monthly_rates(rates, monthly_rates)
             log(f"✅ 환율 확인 완료 ({time.perf_counter() - t_rate:.1f}초)")
 
             # 출력 라벨/파일명
             year = rate_end.year
             month = rate_end.month
-            disp_label, fname_label = period_labels(shopee_results, lazada_result, qoo10_result, fallback=f"{year}년 {month:02d}월")
+            disp_label, fname_label = period_labels(shopee_results, lazada_result, qoo10_result, ebay_results=ebay_results, fallback=f"{year}년 {month:02d}월")
             fsafe = safe_filename(fname_label or f"{year}{month:02d}")
-            company = company_name_from_results(shopee_results, lazada_result, qoo10_result)
+            company = company_name_from_results(shopee_results, lazada_result, qoo10_result, ebay_results=ebay_results)
 
             created = []
             t_excel = time.perf_counter()
@@ -401,6 +463,7 @@ if process_btn:
                         qoo10_result=qoo10_result,
                         rates=rates,
                         output_path=str(sales_path),
+                        ebay_results=ebay_results,
                         year=year,
                         month=month,
                     )
@@ -408,7 +471,7 @@ if process_btn:
                 log(f"[OK] 매출집계 생성: {sales_path.name}")
 
             if make_zero or make_export:
-                rows = build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates)
+                rows = build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, ebay_results=ebay_results)
                 if make_zero:
                     zero_mode_arg = "all" if zero_doc_mode == "전체" else "monthly"
                     zero_files = create_zero_rate_attachments(
