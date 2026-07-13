@@ -16,6 +16,7 @@ COUNTRY_TO_CURRENCY = {
     'MY': 'MYR', 'PH': 'PHP', 'SG': 'SGD',
     'TH': 'THB', 'TW': 'TWD', 'VN': 'VND', 'JP': 'JPY',
     'BR': 'BRL', 'MX': 'MXN',
+    'US': 'USD', 'EU': 'EUR', 'GB': 'GBP', 'CA': 'CAD', 'AU': 'AUD',
 }
 
 CURRENCY_NAMES_KR = {
@@ -26,6 +27,11 @@ CURRENCY_NAMES_KR = {
     'TWD': '대만 달러 (TWD)',
     'VND': '베트남 동 (VND)',
     'JPY': '일본 엔 (JPY) (100)',
+    'USD': '미국 달러 (USD)',
+    'EUR': '유로 (EUR)',
+    'GBP': '영국 파운드 (GBP)',
+    'CAD': '캐나다 달러 (CAD)',
+    'AUD': '호주 달러 (AUD)',
 }
 
 # 파일명에서 국가코드 감지
@@ -37,13 +43,15 @@ SHOPEE_FILE_PATTERNS = {
 
 
 def detect_pdf_type(pdf_path: str) -> str:
-    """파일명으로 소포수령증 종류 판단 → 'shopee' | 'lazada' | 'qoo10' | 'unknown'"""
+    """파일명으로 소포수령증 종류 판단 → 'shopee' | 'lazada' | 'qoo10' | 'ebay' | 'unknown'"""
     name = Path(pdf_path).name
     lower = name.lower()
     if '라자다' in name or 'lazada' in lower:
         return 'lazada'
     if '큐텐' in name or 'qoo10' in lower:
         return 'qoo10'
+    if '이베이' in name or 'ebay' in lower or '린코스' in name or 'lincos' in lower or '해외소포수령증' in name:
+        return 'ebay'
     # 쇼피: 업체명과 무관하게 파일명의 국가코드 패턴(_MY_, _TW_ 등)으로 인식
     if re.search(r'_(MY|PH|SG|TH|TW|VN|BR|MX|JP)_', name):
         return 'shopee'
@@ -321,6 +329,193 @@ def parse_lazada_pdf(pdf_path: str) -> dict:
     }
 
 
+
+# ─────────────────────────────────────────────────────────────────
+# 이베이/린코스 PDF 파싱
+# ─────────────────────────────────────────────────────────────────
+
+def _normalize_korean_date(value: str) -> str:
+    """2026년01월01일 / 2026-01-01 / 2026.01.01 → YYYY-MM-DD"""
+    d = re.sub(r'\D', '', str(value or ''))
+    if len(d) >= 8:
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+    return ''
+
+
+def _normalize_month(value: str) -> str:
+    """2026-03 / 2026년 03월 → YYYY-MM"""
+    text = str(value or '').strip()
+    m = re.search(r'(20\d{2})\D*([01]?\d)', text)
+    if not m:
+        return ''
+    y = m.group(1)
+    mo = int(m.group(2))
+    if not 1 <= mo <= 12:
+        return ''
+    return f"{y}-{mo:02d}"
+
+
+def _month_start_end(month_key: str):
+    """YYYY-MM → (YYYY-MM-01, YYYY-MM-last_day)"""
+    import calendar
+    m = _normalize_month(month_key)
+    if not m:
+        return '', ''
+    y, mo = map(int, m.split('-'))
+    last = calendar.monthrange(y, mo)[1]
+    return f"{y}-{mo:02d}-01", f"{y}-{mo:02d}-{last:02d}"
+
+
+def _num(value, default=0.0):
+    s = str(value or '').replace(',', '').strip()
+    if not s:
+        return default
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+
+def parse_ebay_lincos_pdf(pdf_path: str) -> dict:
+    """
+    이베이 - 린코스 해외배송 소포 수령증 파싱.
+    이 양식은 개별 발행일이 아니라 발행월별 합계가 있으므로,
+    각 행에 month=YYYY-MM을 저장하고 이후 월평균 매매기준율을 적용합니다.
+    """
+    submitter = {'name': '', 'biz_no': '', 'ceo': '', 'address': ''}
+    carrier = '린코스(주)'
+    period_start = ''
+    period_end = ''
+    write_date = ''
+    items = []
+    summary_items = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables() or []
+            for table in tables:
+                if not table:
+                    continue
+                # 제출자 인적사항 표: 거래기간/작성일자가 함께 있는 상단 표만 사용
+                header_text_for_submitter = ' '.join(str(c or '') for row in table for c in row)
+                if (any(row and any('사업자등록번호' in str(c or '') for c in row) for row in table)
+                        and ('거래기간' in header_text_for_submitter or '작성일자' in header_text_for_submitter)):
+                    for row in table:
+                        cells = [str(c or '').strip() for c in row]
+                        joined = ' '.join(cells)
+                        if '사업자등록번호' in joined:
+                            for i, c in enumerate(cells):
+                                if '사업자등록번호' in c and i + 1 < len(cells):
+                                    submitter['biz_no'] = cells[i + 1]
+                                if '상호' in c and i + 1 < len(cells):
+                                    submitter['name'] = cells[i + 1]
+                        if '성명' in joined:
+                            for i, c in enumerate(cells):
+                                if '성명' in c and i + 1 < len(cells):
+                                    submitter['ceo'] = cells[i + 1]
+                                if '사업장 소재지' in c and i + 1 < len(cells):
+                                    submitter['address'] = cells[i + 1].replace('\n', ' ')
+                        if '거래기간' in joined:
+                            for i, c in enumerate(cells):
+                                if '거래기간' in c and i + 1 < len(cells):
+                                    raw = cells[i + 1]
+                                    parts = re.split(r'~|–|-{2,}', raw)
+                                    if len(parts) >= 2:
+                                        period_start = _normalize_korean_date(parts[0])
+                                        period_end = _normalize_korean_date(parts[1])
+                                if '작성일자' in c and i + 1 < len(cells):
+                                    write_date = _normalize_korean_date(cells[i + 1])
+
+                header_text = ' '.join(str(c or '') for row in table for c in row)
+                # 2. 소포 수령증 요약 표
+                if '현지송장번호' in header_text and '통화단위' in header_text:
+                    cur_carrier = carrier
+                    cur_service = ''
+                    cur_tracking = ''
+                    for row in table[1:]:
+                        if not row or len(row) < 6:
+                            continue
+                        r = [(c if c is not None else '') for c in row]
+                        if str(r[0]).strip():
+                            cur_carrier = str(r[0]).strip()
+                        if str(r[1]).strip():
+                            cur_service = str(r[1]).strip()
+                        if str(r[2]).strip():
+                            cur_tracking = str(r[2]).replace('\n', '').strip()
+                        currency = str(r[3]).strip().upper()
+                        if not re.fullmatch(r'[A-Z]{3}', currency):
+                            continue
+                        qty = int(_num(r[4], 0))
+                        amount = _num(r[5], 0)
+                        if qty or amount:
+                            summary_items.append({
+                                'carrier': cur_carrier or carrier,
+                                'service': cur_service,
+                                'tracking_no': cur_tracking,
+                                'currency': currency,
+                                'qty': qty,
+                                'amount': amount,
+                            })
+
+                # 3. 해외배송 내역서 월별 표
+                if '발행월' in header_text and '통화단위' in header_text and '신고금액' in header_text:
+                    cur_month = ''
+                    cur_carrier = carrier
+                    cur_service = ''
+                    for row in table:
+                        if not row or len(row) < 6:
+                            continue
+                        r = [(c if c is not None else '') for c in row]
+                        first = str(r[0] or '').strip()
+                        mkey = _normalize_month(first)
+                        if mkey:
+                            cur_month = mkey
+                        if str(r[1]).strip() and '해외배송업체' not in str(r[1]):
+                            cur_carrier = str(r[1]).strip()
+                        if str(r[2]).strip() and '배송국가' not in str(r[2]):
+                            cur_service = str(r[2]).strip()
+                        currency = str(r[3] or '').strip().upper()
+                        if not cur_month or not re.fullmatch(r'[A-Z]{3}', currency):
+                            continue
+                        qty = int(_num(r[4], 0))
+                        amount = _num(r[5], 0)
+                        if not qty and not amount:
+                            continue
+                        month_start, month_end = _month_start_end(cur_month)
+                        items.append({
+                            'carrier': cur_carrier or carrier,
+                            'service': cur_service,
+                            'country': cur_service,
+                            'destination': cur_service,
+                            'tracking_no': '',
+                            'month': cur_month,
+                            'date': month_end,
+                            'period_start': month_start,
+                            'period_end': month_end,
+                            'currency': currency,
+                            'qty': qty,
+                            'amount': amount,
+                            'rate_basis': 'monthly_average',
+                        })
+
+    if not period_start or not period_end:
+        months = sorted({_normalize_month(it.get('month', '')) for it in items if _normalize_month(it.get('month', ''))})
+        if months:
+            period_start = _month_start_end(months[0])[0]
+            period_end = _month_start_end(months[-1])[1]
+
+    return {
+        'type': 'ebay',
+        'platform': '이베이',
+        'carrier': carrier,
+        'submitter': submitter,
+        'period_start': period_start,
+        'period_end': period_end,
+        'write_date': write_date,
+        'items': items,
+        'summary_items': summary_items,
+    }
+
 # ─────────────────────────────────────────────────────────────────
 # 큐텐 PDF (이미지 기반 → OCR 자동 추출)
 # ─────────────────────────────────────────────────────────────────
@@ -475,9 +670,14 @@ def parse_qoo10_pdf(pdf_path: str) -> Optional[dict]:
 # 통합 파싱 함수
 # ─────────────────────────────────────────────────────────────────
 
-def parse_pdf(pdf_path: str) -> Optional[dict]:
-    """PDF 종류 자동 감지 후 파싱"""
-    pdf_type = detect_pdf_type(pdf_path)
+def parse_pdf(pdf_path: str, forced_type: str = None) -> Optional[dict]:
+    """PDF 종류 자동 감지 또는 사용자가 선택한 종류로 파싱"""
+    pdf_type = (forced_type or detect_pdf_type(pdf_path) or 'unknown').strip().lower()
+    aliases = {
+        'ebay_lincos': 'ebay', 'lincos': 'ebay', '이베이': 'ebay',
+        '쇼피': 'shopee', '라자다': 'lazada', '큐텐': 'qoo10', '큐텐재팬': 'qoo10',
+    }
+    pdf_type = aliases.get(pdf_type, pdf_type)
     print(f"  파싱 중: {Path(pdf_path).name} → [{pdf_type}]")
 
     if pdf_type == 'shopee':
@@ -486,6 +686,8 @@ def parse_pdf(pdf_path: str) -> Optional[dict]:
         return parse_lazada_pdf(pdf_path)
     elif pdf_type == 'qoo10':
         return parse_qoo10_pdf(pdf_path)
+    elif pdf_type == 'ebay':
+        return parse_ebay_lincos_pdf(pdf_path)
     else:
         print(f"  ⚠️  알 수 없는 PDF 형식: {Path(pdf_path).name}")
         return None

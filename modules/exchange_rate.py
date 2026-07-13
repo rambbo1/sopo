@@ -17,6 +17,7 @@ import time
 import shutil
 import bisect
 import json
+from io import StringIO
 from pathlib import Path
 from datetime import datetime, date
 from urllib.parse import urlencode
@@ -27,7 +28,10 @@ import requests
 
 SMBS_STD_RATE_URL = "http://www.smbs.biz/ExRate/StdExRate.jsp"
 SMBS_STD_RATE_PRINT_URL = "http://www.smbs.biz/ExRate/StdExRate_print.jsp"
+SMBS_MON_AVG_RATE_URL = "http://www.smbs.biz/ExRate/MonAvgStdExRate.jsp"
+SMBS_MON_AVG_RATE_PRINT_URL = "http://www.smbs.biz/ExRate/MonAvgStdExRate_print.jsp"
 RATE_CACHE_FILE = Path(__file__).resolve().parents[1] / "data" / "exchange_rate_cache.csv"
+MONTHLY_RATE_CACHE_FILE = Path(__file__).resolve().parents[1] / "data" / "monthly_exchange_rate_cache.csv"
 _FIXED_RATE_JSON_CANDIDATES = [
     Path(__file__).resolve().parents[1] / "data" / "fixed_rates_2025.json",
     Path(__file__).resolve().parents[1] / "fixed_rates_2025.json",
@@ -47,10 +51,18 @@ CURRENCY_NAMES = {
     "BRL": "브라질 헤알 (BRL)",
     "MXN": "멕시코 페소 (MXN)",
     "USD": "미국 달러 (USD)",
+    "EUR": "유로 (EUR)",
+    "GBP": "영국 파운드 (GBP)",
+    "CAD": "캐나다 달러 (CAD)",
+    "AUD": "호주 달러 (AUD)",
 }
 
 CURRENCY_KOREAN_KEYWORDS = {
     "USD": ["미국", "달러", "USD"],
+    "EUR": ["유로", "EUR"],
+    "GBP": ["영국", "파운드", "GBP"],
+    "CAD": ["캐나다", "달러", "CAD"],
+    "AUD": ["호주", "달러", "AUD"],
     "JPY": ["일본", "엔", "JPY"],
     "TWD": ["대만", "달러", "TWD"],
     "THB": ["태국", "밧", "바트", "THB"],
@@ -284,7 +296,7 @@ def parse_rate_table_from_html(html, currency, debug_prefix=None):
         return pd.DataFrame(columns=["date", "rate"])
 
     try:
-        tables = pd.read_html(html)
+        tables = pd.read_html(StringIO(html))
     except Exception:
         tables = []
 
@@ -823,3 +835,344 @@ def avg_rate_for_period(rate_data: dict, start: str, end: str) -> float:
     if vals:
         return round(sum(vals) / len(vals), 4)
     return get_rate_for_date(rate_data, e) or float(rate_data.get("average", 0.0) or 0.0)
+
+
+# ────────────────────────────────────────────────────────────────
+# 월평균 매매기준율 수집/캐시 — 이베이/린코스처럼 발행월만 있는 자료용
+# ────────────────────────────────────────────────────────────────
+
+def parse_month_key(value) -> str:
+    """문자열/날짜를 YYYY-MM으로 정규화합니다."""
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        dt = pd.to_datetime(value, errors="coerce")
+        return "" if pd.isna(dt) else dt.strftime("%Y-%m")
+    s = str(value).strip()
+    # 2026-03, 2026.03, 2026년 03월, 202603
+    m = re.search(r"(20\d{2})\D*([01]?\d)", s)
+    if m:
+        y = int(m.group(1)); mo = int(m.group(2))
+        if 1 <= mo <= 12:
+            return f"{y:04d}-{mo:02d}"
+    d = re.sub(r"\D", "", s)
+    if len(d) >= 6:
+        y = int(d[:4]); mo = int(d[4:6])
+        if 1 <= mo <= 12:
+            return f"{y:04d}-{mo:02d}"
+    return ""
+
+
+def _strip_smbs_scripts(value) -> str:
+    """SMBS 페이지의 d1('...'); 난독화 스크립트를 제거하고 화면 표시 텍스트만 남깁니다."""
+    text = str(value or "")
+    text = re.sub(r"d\d?\(\s*['\"].*?['\"]\s*\);", "", text)
+    return text.strip()
+
+
+def _month_start(month_key):
+    mk = parse_month_key(month_key)
+    if not mk:
+        return pd.NaT
+    return pd.Timestamp(year=int(mk[:4]), month=int(mk[5:7]), day=1)
+
+
+def _month_end(month_key):
+    ms = _month_start(month_key)
+    if pd.isna(ms):
+        return pd.NaT
+    return ms + pd.offsets.MonthEnd(0)
+
+
+def _months_between_keys(start_month, end_month):
+    start = _month_start(start_month)
+    end = _month_start(end_month)
+    if pd.isna(start) or pd.isna(end):
+        return []
+    if end < start:
+        start, end = end, start
+    return [d.strftime("%Y-%m") for d in pd.date_range(start, end, freq="MS")]
+
+
+def load_monthly_rate_cache(currency=None):
+    path = Path(MONTHLY_RATE_CACHE_FILE)
+    if not path.exists():
+        return pd.DataFrame(columns=["currency", "year_month", "rate", "fetched_at"])
+    try:
+        df = pd.read_csv(path, dtype={"currency": str, "year_month": str})
+        if df.empty:
+            return pd.DataFrame(columns=["currency", "year_month", "rate", "fetched_at"])
+        df["currency"] = df["currency"].astype(str).str.upper().str.strip()
+        df["year_month"] = df["year_month"].apply(parse_month_key)
+        df["rate"] = df["rate"].apply(to_number)
+        df = df.dropna(subset=["currency", "year_month", "rate"])
+        df = df[df["year_month"].astype(bool)]
+        if currency:
+            df = df[df["currency"] == str(currency).upper()].copy()
+        return df.drop_duplicates(subset=["currency", "year_month"], keep="last").sort_values(["currency", "year_month"])
+    except Exception as e:
+        _log(f"[WARN] 월평균 환율 캐시를 읽지 못했습니다. 새로 수집합니다: {e}")
+        return pd.DataFrame(columns=["currency", "year_month", "rate", "fetched_at"])
+
+
+def save_monthly_rate_cache(currency, data):
+    if data is None or data.empty:
+        return
+    path = Path(MONTHLY_RATE_CACHE_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_df = data[["year_month", "rate"]].copy()
+    new_df["currency"] = str(currency).upper()
+    new_df["year_month"] = new_df["year_month"].apply(parse_month_key)
+    new_df["rate"] = new_df["rate"].apply(to_number)
+    new_df["fetched_at"] = datetime.now().isoformat(timespec="seconds")
+    new_df = new_df.dropna(subset=["year_month", "rate"])[["currency", "year_month", "rate", "fetched_at"]]
+    new_df = new_df[new_df["year_month"].astype(bool)]
+    old_df = load_monthly_rate_cache()
+    merged = pd.concat([old_df, new_df], ignore_index=True)
+    merged["currency"] = merged["currency"].astype(str).str.upper().str.strip()
+    merged["year_month"] = merged["year_month"].apply(parse_month_key)
+    merged["rate"] = merged["rate"].apply(to_number)
+    merged = merged.dropna(subset=["currency", "year_month", "rate"])
+    merged = merged[merged["year_month"].astype(bool)]
+    merged = merged.drop_duplicates(subset=["currency", "year_month"], keep="last").sort_values(["currency", "year_month"])
+    merged.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def build_smbs_month_avg_params(currency, start_month, end_month):
+    sdt = _month_start(start_month)
+    edt = _month_start(end_month)
+    return {
+        "StrSch_sYear": sdt.strftime("%Y"),
+        "StrSch_sMonth": sdt.strftime("%m"),
+        "StrSch_sDay": "01",
+        "StrSch_eYear": edt.strftime("%Y"),
+        "StrSch_eMonth": edt.strftime("%m"),
+        "StrSch_eDay": "01",
+        "quick_date": "",
+        "tongwha_code": currency,
+    }
+
+
+def build_smbs_month_avg_url(currency, start_month, end_month, base_url=SMBS_MON_AVG_RATE_URL):
+    return f"{base_url}?{urlencode(build_smbs_month_avg_params(currency, start_month, end_month))}"
+
+
+def parse_month_avg_table_from_html(html, currency):
+    if not html:
+        return pd.DataFrame(columns=["year_month", "rate"])
+    candidates = []
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception:
+        tables = []
+    for table in tables:
+        if table is None or table.empty:
+            continue
+        if table.shape[1] < 3:
+            continue
+        records = []
+        for _, row in table.iterrows():
+            vals = row.tolist()
+            joined = " ".join(str(v) for v in vals if not pd.isna(v))
+            if re.search(r"\([A-Z]{3}\)", joined) and not row_mentions_currency(vals, currency):
+                continue
+            mkey = ""
+            for v in vals:
+                mk = parse_month_key(_strip_smbs_scripts(v))
+                if mk:
+                    mkey = mk
+                    break
+            if not mkey:
+                continue
+            nums = []
+            for v in vals:
+                if is_currency_name_cell(v, currency):
+                    continue
+                raw = _strip_smbs_scripts(v)
+                # 연월 셀 숫자는 환율 후보에서 제외
+                if parse_month_key(raw) == mkey and re.search(r"20\d{2}", raw):
+                    continue
+                num = to_number(raw)
+                if num is None:
+                    matches = re.findall(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?", raw)
+                    for candidate in reversed(matches):
+                        num = to_number(candidate)
+                        if num is not None:
+                            break
+                if num is None or num <= 0:
+                    continue
+                if 1 <= num <= 12 or 1900 <= num <= 2100:
+                    continue
+                if currency.upper() in {"VND", "JPY", "IDR"} and abs(num - 100) < 1e-9:
+                    continue
+                nums.append(num)
+            if nums:
+                records.append({"year_month": mkey, "rate": float(nums[0])})
+        if records:
+            df = pd.DataFrame(records).drop_duplicates(subset=["year_month"], keep="last").sort_values("year_month")
+            if not df.empty:
+                candidates.append(df)
+    if not candidates:
+        # HTML 텍스트 백업 파싱
+        text = re.sub(r"<script.*?</script>", " ", html, flags=re.I | re.S)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text).replace("&nbsp;", " ")
+        pat = re.compile(r"(20\d{2})[.\-/년\s]*(0?[1-9]|1[0-2])\D{0,50}?([-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?)")
+        records = []
+        for m in pat.finditer(text):
+            mkey = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
+            rate = to_number(m.group(3))
+            if rate and rate > 0:
+                records.append({"year_month": mkey, "rate": rate})
+        if records:
+            candidates.append(pd.DataFrame(records).drop_duplicates(subset=["year_month"], keep="last").sort_values("year_month"))
+    if not candidates:
+        return pd.DataFrame(columns=["year_month", "rate"])
+    return max(candidates, key=len)[["year_month", "rate"]].copy()
+
+
+def try_fetch_month_avg_rates_by_requests(currency, start_month, end_month, timeout=10):
+    session = requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": SMBS_MON_AVG_RATE_URL,
+        "Origin": "http://www.smbs.biz",
+    }
+    params = build_smbs_month_avg_params(currency, start_month, end_month)
+    attempts = [
+        ("print_get", "GET", build_smbs_month_avg_url(currency, start_month, end_month, SMBS_MON_AVG_RATE_PRINT_URL), None),
+        ("direct_get", "GET", build_smbs_month_avg_url(currency, start_month, end_month, SMBS_MON_AVG_RATE_URL), None),
+        ("get_params", "GET", SMBS_MON_AVG_RATE_URL, params),
+        ("post", "POST", SMBS_MON_AVG_RATE_URL, params),
+    ]
+    try:
+        session.get(SMBS_MON_AVG_RATE_URL, headers=headers, timeout=min(timeout, 8))
+    except Exception:
+        pass
+    needed = set(_months_between_keys(start_month, end_month))
+    for _, method, url, payload in attempts:
+        try:
+            if method == "POST":
+                h = dict(headers)
+                h["Content-Type"] = "application/x-www-form-urlencoded"
+                resp = session.post(url, data=payload, headers=h, timeout=timeout)
+            else:
+                resp = session.get(url, params=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            enc = resp.apparent_encoding or resp.encoding or "cp949"
+            if str(enc).lower() in ["iso-8859-1", "ascii"]:
+                enc = "cp949"
+            resp.encoding = enc
+            data = parse_month_avg_table_from_html(resp.text, currency)
+            if not data.empty:
+                data = data[data["year_month"].isin(needed)].copy()
+                if not data.empty:
+                    return data
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["year_month", "rate"])
+
+
+def get_cached_or_fetch_month_avg_rates(currency, start_month, end_month):
+    currency = str(currency).upper()
+    months = _months_between_keys(start_month, end_month)
+    cache = load_monthly_rate_cache(currency)
+    have = set(cache["year_month"].tolist()) if not cache.empty else set()
+    missing = [m for m in months if m not in have]
+    if not missing:
+        _log(f"  - {currency}: 저장된 월평균 환율 사용")
+        return cache[cache["year_month"].isin(months)][["year_month", "rate"]].drop_duplicates(subset=["year_month"], keep="last").sort_values("year_month")
+    _log(f"  - {currency}: 부족한 월평균 환율 수집")
+    fetched = try_fetch_month_avg_rates_by_requests(currency, missing[0], missing[-1])
+    # 월평균 페이지 수집 실패 시 기간별 일별 환율 평균으로 보완합니다.
+    if fetched.empty or not set(missing).issubset(set(fetched.get("year_month", []))):
+        fallback_rows = []
+        fetched_have = set(fetched.get("year_month", [])) if not fetched.empty else set()
+        for m in missing:
+            if m in fetched_have:
+                continue
+            raw = get_cached_or_fetch_smbs_period_rates(currency, _month_start(m), _month_end(m))
+            if raw is not None and not raw.empty:
+                fallback_rows.append({"year_month": m, "rate": round(float(raw["rate"].mean()), 4)})
+        if fallback_rows:
+            fetched = pd.concat([fetched, pd.DataFrame(fallback_rows)], ignore_index=True) if not fetched.empty else pd.DataFrame(fallback_rows)
+    save_monthly_rate_cache(currency, fetched)
+    cache = load_monthly_rate_cache(currency)
+    return cache[cache["year_month"].isin(months)][["year_month", "rate"]].drop_duplicates(subset=["year_month"], keep="last").sort_values("year_month")
+
+
+def _to_month_rate_entry(currency, raw_df, start_month, end_month):
+    months = _months_between_keys(start_month, end_month)
+    raw_df = raw_df.copy() if raw_df is not None else pd.DataFrame(columns=["year_month", "rate"])
+    raw_df["year_month"] = raw_df.get("year_month", pd.Series(dtype=str)).apply(parse_month_key)
+    raw_df["rate"] = raw_df.get("rate", pd.Series(dtype=float)).apply(to_number)
+    raw_df = raw_df.dropna(subset=["year_month", "rate"])
+    monthly = []
+    vals = []
+    lookup = {r["year_month"]: float(r["rate"]) for _, r in raw_df.iterrows() if r.get("year_month")}
+    for m in months:
+        rate = lookup.get(m, 0.0)
+        monthly.append({"year_month": m, "rate": rate})
+        if rate:
+            vals.append(rate)
+    return {
+        "period": f"{months[0] if months else ''} ~ {months[-1] if months else ''}",
+        "currency": currency,
+        "currency_name": CURRENCY_NAMES.get(currency, currency),
+        "average": round(sum(vals) / len(vals), 4) if vals else 0.0,
+        "min": min(vals) if vals else 0.0,
+        "max": max(vals) if vals else 0.0,
+        "min_date": "",
+        "max_date": "",
+        "range": round(max(vals) - min(vals), 4) if vals else 0.0,
+        "cross_rate": 0.0,
+        "daily": [],
+        "monthly": monthly,
+    }
+
+
+def fetch_monthly_avg_currencies_for_period(start_month, end_month, currencies: Iterable[str], logger: Optional[Callable[[str], None]] = None):
+    previous_logger = _LOGGER
+    set_logger(logger or previous_logger)
+    try:
+        out = {}
+        used = [str(c).upper() for c in currencies if c]
+        if used:
+            _log(f"💱 월평균 환율 확인 중... ({', '.join(used)})")
+        for cur in used:
+            raw = get_cached_or_fetch_month_avg_rates(cur, start_month, end_month)
+            out[cur] = _to_month_rate_entry(cur, raw, start_month, end_month)
+        if used:
+            _log("✅ 월평균 환율 확인 완료")
+        return out
+    finally:
+        set_logger(previous_logger)
+
+
+def merge_monthly_rates(base_rates: dict, monthly_rates: dict) -> dict:
+    """기존 일별 rate_data에 monthly 목록을 병합합니다."""
+    out = dict(base_rates or {})
+    for cur, mdata in (monthly_rates or {}).items():
+        if cur in out and out[cur]:
+            out[cur]["monthly"] = mdata.get("monthly", [])
+            out[cur]["monthly_average"] = mdata.get("average", 0.0)
+        else:
+            out[cur] = mdata
+    return out
+
+
+def monthly_avg_rate_for_month(rate_data: dict, month_key: str) -> float:
+    mk = parse_month_key(month_key)
+    if not rate_data:
+        return 0.0
+    for row in rate_data.get("monthly", []) or []:
+        if parse_month_key(row.get("year_month")) == mk:
+            return float(row.get("rate") or 0.0)
+    # 월평균 데이터가 없으면 일별 환율 평균으로 보완
+    s = _month_start(mk)
+    e = _month_end(mk)
+    if pd.isna(s) or pd.isna(e):
+        return float(rate_data.get("average", 0.0) or 0.0)
+    return avg_rate_for_period(rate_data, s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"))

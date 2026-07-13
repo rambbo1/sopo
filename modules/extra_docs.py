@@ -12,7 +12,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from .exchange_rate import get_rate_for_date, avg_rate_for_period
+from .exchange_rate import get_rate_for_date, avg_rate_for_period, monthly_avg_rate_for_month
 
 RATE_DIVISOR = {"JPY": 100, "VND": 100}
 TRACKING_NO_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{13}$", re.I)
@@ -55,7 +55,7 @@ def other_zero_rate_count_value(value=None):
     return 1
 
 
-def _company_name(shopee_results, lazada_result, qoo10_result):
+def _company_name(shopee_results, lazada_result, qoo10_result, ebay_results=None):
     for sd in shopee_results or []:
         sub = sd.get("submitter") or {}
         if sub.get("name"):
@@ -64,10 +64,14 @@ def _company_name(shopee_results, lazada_result, qoo10_result):
         sub = lazada_result.get("submitter") or {}
         if sub.get("name"):
             return sub.get("name")
+    for er in ebay_results or []:
+        sub = er.get("submitter") or {}
+        if sub.get("name"):
+            return sub.get("name")
     return "회사이름"
 
 
-def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates):
+def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, ebay_results=None):
     """선택 문서 생성에 공통으로 쓰는 수출/영세율 행 목록 생성."""
     rows = []
 
@@ -110,6 +114,31 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates):
                 "platform": "라자다",
                 "issuer": it.get("carrier") or lazada_result.get("carrier") or "용성종합물류",
                 "tracking_no": tracking,
+                "export_no": "",
+                "other_count": 1,
+                "ship_date": ship_date,
+                "issue_date": ship_date,
+                "currency": cur,
+                "rate": rate,
+                "foreign": amount,
+                "krw": krw,
+            })
+
+
+    for er in ebay_results or []:
+        for it in er.get("items", []):
+            cur = it.get("currency", "")
+            if not cur:
+                continue
+            div = RATE_DIVISOR.get(cur, 1)
+            rate = monthly_avg_rate_for_month(rates.get(cur), it.get("month") or it.get("date") or "")
+            amount = float(it.get("amount", 0) or 0)
+            krw = round(amount * rate / div)
+            ship_date = date_to_int(it.get("date") or it.get("period_end") or "")
+            rows.append({
+                "platform": "이베이",
+                "issuer": it.get("carrier") or er.get("carrier") or "린코스(주)",
+                "tracking_no": it.get("tracking_no", ""),
                 "export_no": "",
                 "other_count": 1,
                 "ship_date": ship_date,
@@ -317,5 +346,5 @@ def create_zero_rate_attachments(
     return created
 
 
-def company_name_from_results(shopee_results, lazada_result=None, qoo10_result=None):
-    return _company_name(shopee_results, lazada_result, qoo10_result)
+def company_name_from_results(shopee_results, lazada_result=None, qoo10_result=None, ebay_results=None):
+    return _company_name(shopee_results, lazada_result, qoo10_result, ebay_results=ebay_results)
