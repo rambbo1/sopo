@@ -757,7 +757,7 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
             'krw':    round(qoo10_data.get('amount', 0) * jpy_rate / 100),
         }]
 
-        ws.cell(row=18, column=8, value='적용: 발행일별 환율 (100엔)')
+        ws.cell(row=18, column=8, value='적용: 거래기간 평균환율 (100엔)')
 
         r = 19
         total_jpy = 0
@@ -1057,6 +1057,26 @@ def _prune_workbook_sheets(wb, keep_sheet_names):
 
 # ── 월별집계 시트 ───────────────────────────────────────────────
 
+
+
+def _qoo10_reporting_date(entry=None, result=None):
+    """큐텐 신고/집계 기준일: 거래기간 종료일, 없으면 해당 반기말."""
+    entry = entry or {}
+    result = result or {}
+    period_end = entry.get('period_end') or result.get('period_end') or ''
+    digits = re.sub(r'\D', '', str(period_end))[:8]
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+
+    base = (entry.get('period_start') or result.get('period_start')
+            or entry.get('write_date') or result.get('write_date') or '')
+    digits = re.sub(r'\D', '', str(base))[:8]
+    if len(digits) >= 6:
+        year = digits[:4]
+        month = int(digits[4:6])
+        return f"{year}-06-30" if month <= 6 else f"{year}-12-31"
+    return ''
+
 def _month_label_from_date(value):
     """날짜 문자열/숫자에서 'YYYY년 MM월' 라벨을 반환합니다."""
     d = re.sub(r"\D", "", str(value or ""))[:8]
@@ -1077,7 +1097,7 @@ def write_monthly_summary_sheet(ws, shopee_results: list, lazada_result: Optiona
     기준일은 각 문서의 수출실적/통화 시트에 들어가는 선(기)적일자와 동일하게 봅니다.
     - 쇼피: 거래별 발행일(tx['date'])
     - 라자다: 라자다 작성일자(write_date) 또는 기간 종료일
-    - 큐텐: 입력 건별 발행일(write_date)
+    - 큐텐: 입력 건별 거래기간 종료일(상반기 6월 말/하반기 12월 말)
     """
     NUM = '#,##0'
     NUM2 = '#,##0.00'
@@ -1164,14 +1184,14 @@ def write_monthly_summary_sheet(ws, shopee_results: list, lazada_result: Optiona
                 'fx': amount, 'krw': krw,
             })
 
-    # 큐텐: 입력 건별 발행일 기준
+    # 큐텐: 입력 건별 거래기간 종료일 기준
     if qoo10_result and qoo10_result.get('entries'):
         for e in qoo10_result.get('entries', []):
             amount = float(e.get('amount', 0) or 0)
             qty = int(e.get('qty', 0) or 0)
             rate = e.get('rate', jpy_rate)
             krw = e.get('krw', round(amount * rate / 100))
-            date_value = e.get('write_date') or qoo10_result.get('write_date') or qoo10_result.get('period_end') or ''
+            date_value = _qoo10_reporting_date(e, qoo10_result)
             rows.append({
                 'month': _month_label_from_date(date_value),
                 'source': '큐텐', 'currency': 'JPY', 'qty': qty,
@@ -1305,11 +1325,10 @@ def generate_excel(
                 jpy_rate = round(sum(d['rate'] for d in daily) / len(daily), 2)
     else:
         jpy_rate = 0.0
-    # write_date 보존 (선적일자 기재용)
-    qoo10_write_date = ''
+    # 큐텐 신고/집계 기준일은 작성일이 아니라 거래기간 종료일입니다.
+    qoo10_report_date = ''
     if qoo10_result:
-        qoo10_write_date = (qoo10_result.get('write_date', '')
-                            or qoo10_result.get('period_end', ''))
+        qoo10_report_date = _qoo10_reporting_date({}, qoo10_result)
         # 큐텐 전체 거래기간 평균환율을 대표 환율로 사용 (표시·폴백용)
         _qs = qoo10_result.get('period_start', '')
         _qe = qoo10_result.get('period_end', '')
@@ -1326,6 +1345,8 @@ def generate_excel(
                 'qty':         qoo10_result.get('qty', 0),
                 'amount':      qoo10_result.get('amount', 0),
                 'write_date':  qoo10_result.get('write_date', ''),
+                'period_start': qoo10_result.get('period_start', ''),
+                'period_end':   qoo10_result.get('period_end', ''),
             }]
         q_total_krw = 0
         for e in q_entries:
@@ -1464,11 +1485,11 @@ def generate_excel(
         ws_jpy.cell(row=1, column=7, value=qoo10_result.get('total_krw', 0)).number_format = NUM_FMT
         _jr = 5
         for e in qoo10_result.get('entries', []):
-            wd = e.get('write_date', '') or qoo10_write_date
+            report_date = _qoo10_reporting_date(e, qoo10_result) or qoo10_report_date
             date_str = ''
-            if wd:
+            if report_date:
                 try:
-                    date_str = int(str(wd).replace('-', '').replace('.', ''))
+                    date_str = int(re.sub(r'\D', '', str(report_date))[:8])
                 except ValueError:
                     date_str = ''
             tracking = e.get('tracking_no') or qoo10_result.get('tracking_no', '')

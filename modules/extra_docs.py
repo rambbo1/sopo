@@ -46,6 +46,31 @@ def date_to_month_key(value):
     return f"{d[:4]}년{d[4:6]}월" if len(d) == 8 else "날짜없음"
 
 
+
+
+def qoo10_reporting_date(entry=None, result=None):
+    """큐텐 신고 기준일을 거래기간 종료일로 반환합니다.
+
+    PDF/STEP 2에 거래기간 종료일이 있으면 그 날짜를 그대로 사용하고,
+    종료일이 비어 있을 때만 시작일 또는 작성일을 기준으로 반기말
+    (6월 30일 또는 12월 31일)을 보완합니다.
+    """
+    entry = entry or {}
+    result = result or {}
+    period_end = entry.get("period_end") or result.get("period_end") or ""
+    digits = re.sub(r"\D", "", str(period_end))[:8]
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+
+    base = (entry.get("period_start") or result.get("period_start")
+            or entry.get("write_date") or result.get("write_date") or "")
+    digits = re.sub(r"\D", "", str(base))[:8]
+    if len(digits) >= 6:
+        year = digits[:4]
+        month = int(digits[4:6])
+        return f"{year}-06-30" if month <= 6 else f"{year}-12-31"
+    return ""
+
 def is_valid_tracking_no(value):
     text = re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
     return bool(TRACKING_NO_PATTERN.fullmatch(text))
@@ -165,12 +190,12 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, e
         for e in q_entries:
             ps = e.get("period_start", "") or qoo10_result.get("period_start", "")
             pe = e.get("period_end", "") or qoo10_result.get("period_end", "")
-            wd = e.get("write_date", "") or qoo10_result.get("write_date", "") or pe
+            report_date = qoo10_reporting_date(e, qoo10_result)
             rate = avg_rate_for_period(rates.get("JPY"), ps, pe)
             amount = float(e.get("amount", 0) or 0)
             krw = round(amount * rate / 100)
             tracking = e.get("tracking_no", "") or qoo10_result.get("tracking_no", "")
-            ship_date = date_to_int(wd)
+            ship_date = date_to_int(report_date)
             rows.append({
                 "platform": "큐텐",
                 "issuer": qoo10_result.get("carrier", "국제로지스틱"),
