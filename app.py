@@ -265,9 +265,15 @@ st.divider()
 # STEP 4 — 처리 시작
 # ══════════════════════════════════════════════════════════════════
 st.markdown("### ⚡ STEP 4 — 처리 시작")
-process_btn = st.button("🚀 엑셀 파일 생성하기", type="primary", use_container_width=True, disabled=not bool(uploaded_files))
-if not uploaded_files:
-    st.caption("PDF를 업로드하면 생성 버튼이 활성화됩니다.")
+has_process_input = bool(uploaded_files) or bool(st.session_state.qoo10_entries)
+process_btn = st.button(
+    "🚀 엑셀 파일 생성하기",
+    type="primary",
+    use_container_width=True,
+    disabled=not has_process_input,
+)
+if not has_process_input:
+    st.caption("PDF를 업로드하거나 큐텐재팬 정보를 입력하면 생성 버튼이 활성화됩니다.")
 
 progress_bar = st.empty()
 status_text = st.empty()
@@ -371,7 +377,7 @@ if process_btn:
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         pdf_paths = []
-        for uf in uploaded_files:
+        for uf in (uploaded_files or []):
             p = tmpdir / uf.name
             p.write_bytes(uf.getbuffer())
             pdf_paths.append(p)
