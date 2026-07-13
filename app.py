@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-소포수령증 자동화 웹앱 — GitHub 기존버전 기반 + v29 환율/문서선택 반영
+소포수령증 자동화 웹앱 — v45 큐텐 PDF 자동입력 및 환율 조회기간 보완
 실행: streamlit run app.py
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import hashlib
 import re
 import sys
 import tempfile
@@ -120,6 +121,8 @@ if "qoo10_entries" not in st.session_state:
     st.session_state.qoo10_entries = []
 if "result_files" not in st.session_state:
     st.session_state.result_files = []
+if "qoo10_auto_imported_keys" not in st.session_state:
+    st.session_state.qoo10_auto_imported_keys = set()
 
 # 파일명으로 구분되지 않는 PDF에만 직접 선택 항목을 표시합니다.
 # 일반 화면의 문구와 배치는 v38과 동일하게 유지합니다.
@@ -136,11 +139,12 @@ UNKNOWN_PDF_TYPE_TO_CODE = {
 # ══════════════════════════════════════════════════════════════════
 st.markdown("### 📄 STEP 1 — 소포수령증 PDF 업로드")
 c_desc, c_reset = st.columns([6, 1])
-c_desc.caption("쇼피, 라자다 PDF를 한꺼번에 올려주세요. 큐텐재팬은 STEP 2에서 직접 입력합니다.")
+c_desc.caption("쇼피, 라자다, 큐텐재팬 PDF를 한꺼번에 올려주세요.")
 if c_reset.button("🔄 초기화"):
     st.session_state.uploader_key += 1
     st.session_state.qoo10_entries = []
     st.session_state.result_files = []
+    st.session_state.qoo10_auto_imported_keys = set()
     st.rerun()
 
 uploaded_files = st.file_uploader(
@@ -151,11 +155,29 @@ uploaded_files = st.file_uploader(
     key=f"pdf_uploader_{st.session_state.uploader_key}",
 )
 
+@st.cache_data(show_spinner=False)
+def _detect_uploaded_pdf_type(filename: str, payload: bytes) -> str:
+    """파일명이 일반적이어도 PDF 본문 표식으로 플랫폼을 자동 판별합니다."""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / (Path(filename).name or "uploaded.pdf")
+        path.write_bytes(payload)
+        return detect_pdf_type(str(path))
+
+
+@st.cache_data(show_spinner=False)
+def _parse_uploaded_qoo10(filename: str, payload: bytes):
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / (Path(filename).name or "qoo10.pdf")
+        path.write_bytes(payload)
+        return parse_pdf(str(path), forced_type="qoo10")
+
+
 uploaded_type_choices = {}
 if uploaded_files:
     cols = st.columns(2)
     for i, f in enumerate(uploaded_files):
-        ptype = detect_pdf_type(f.name)
+        payload = f.getvalue()
+        ptype = _detect_uploaded_pdf_type(f.name, payload)
         icon = {"shopee": "🛍️", "lazada": "🟠", "qoo10": "🇯🇵", "ebay": "🛒", "unknown": "❓"}.get(ptype, "📄")
         label = {"shopee": "쇼피", "lazada": "라자다", "qoo10": "큐텐재팬", "ebay": "이베이", "unknown": "미확인"}.get(ptype, "")
         target_col = cols[i % 2]
@@ -171,6 +193,47 @@ if uploaded_files:
         else:
             uploaded_type_choices[f.name] = ptype
 
+    # 큐텐재팬 PDF는 업로드 즉시 파싱하여 STEP 2 입력 목록에 자동 반영합니다.
+    qoo10_uploads = []
+    for f in uploaded_files:
+        if uploaded_type_choices.get(f.name) != "qoo10":
+            continue
+        payload = f.getvalue()
+        file_key = hashlib.sha256(payload).hexdigest()
+        qoo10_uploads.append((f, payload, file_key))
+
+    # 업로더에서 제거된 PDF의 자동 입력 행은 STEP 2에서도 함께 제거합니다.
+    current_qoo10_keys = {key for _, _, key in qoo10_uploads}
+    st.session_state.qoo10_entries = [
+        entry for entry in st.session_state.qoo10_entries
+        if not entry.get("_auto_imported") or entry.get("_file_key") in current_qoo10_keys
+    ]
+    st.session_state.qoo10_auto_imported_keys = set(st.session_state.qoo10_auto_imported_keys) & current_qoo10_keys
+
+    existing_auto_keys = {
+        entry.get("_file_key") for entry in st.session_state.qoo10_entries
+        if entry.get("_auto_imported") and entry.get("_file_key")
+    }
+    for f, payload, file_key in qoo10_uploads:
+        if file_key in existing_auto_keys or file_key in st.session_state.qoo10_auto_imported_keys:
+            continue
+        result = _parse_uploaded_qoo10(f.name, payload)
+        st.session_state.qoo10_auto_imported_keys.add(file_key)
+        if not result:
+            continue
+        st.session_state.qoo10_entries.append({
+            "period_start": result.get("period_start", ""),
+            "period_end": result.get("period_end", ""),
+            "tracking_no": result.get("tracking_no", ""),
+            "qty": int(result.get("qty", 0) or 0),
+            "amount": float(result.get("amount", 0) or 0),
+            "write_date": result.get("write_date", ""),
+            "_source_file": f.name,
+            "_file_key": file_key,
+            "_auto_imported": True,
+            "_submitter": result.get("submitter") or {},
+        })
+
 st.divider()
 
 # ══════════════════════════════════════════════════════════════════
@@ -178,7 +241,7 @@ st.divider()
 # ══════════════════════════════════════════════════════════════════
 st.markdown("### 🇯🇵 STEP 2 — 큐텐재팬 정보 입력")
 st.markdown(
-    '<div class="warn-box">큐텐재팬 PDF는 자동 추출이 불안정하므로 기존버전과 동일하게 직접 입력합니다.</div>',
+    '<div class="warn-box">큐텐재팬 PDF를 업로드하면 아래 입력 목록에 자동 반영됩니다. 필요한 경우 직접 추가할 수도 있습니다.</div>',
     unsafe_allow_html=True,
 )
 
@@ -213,7 +276,8 @@ if added:
         st.warning("금액·건수·발송번호 중 하나는 입력해야 합니다.")
 
 if st.session_state.qoo10_entries:
-    df_show = pd.DataFrame(st.session_state.qoo10_entries).rename(columns={
+    visible_cols = ["period_start", "period_end", "tracking_no", "qty", "amount", "write_date"]
+    df_show = pd.DataFrame(st.session_state.qoo10_entries)[visible_cols].rename(columns={
         "period_start": "거래기간 시작",
         "period_end": "거래기간 종료",
         "tracking_no": "발송번호",
@@ -313,40 +377,49 @@ def _month_values_for_monthly_rates(ebay_results):
                 months.append(month_value)
     return sorted(set(months))
 
-def _date_values_for_rates(shopee_results, lazada_result, qoo10_result):
-    values = []
+def _daily_rate_period_bounds(shopee_results, lazada_result, qoo10_result):
+    """실제 신고기간의 시작/종료일을 반환합니다. 작성일은 환율시트 기간에 포함하지 않습니다."""
+    starts = []
+    ends = []
+
+    def _add(start_value, end_value):
+        sdt = pd.to_datetime(str(start_value or "").replace(".", "-"), errors="coerce")
+        edt = pd.to_datetime(str(end_value or "").replace(".", "-"), errors="coerce")
+        if not pd.isna(sdt):
+            starts.append(sdt.normalize())
+        if not pd.isna(edt):
+            ends.append(edt.normalize())
+
     for sd in shopee_results or []:
-        for key in ["period_start", "period_end", "write_date"]:
-            if sd.get(key):
-                values.append(sd[key])
-        for tx in sd.get("transactions", []):
-            if tx.get("date"):
-                values.append(tx["date"])
+        _add(sd.get("period_start"), sd.get("period_end"))
+        if not sd.get("period_start") or not sd.get("period_end"):
+            tx_dates = [pd.to_datetime(str(tx.get("date", "")).replace(".", "-"), errors="coerce") for tx in sd.get("transactions", [])]
+            tx_dates = [d.normalize() for d in tx_dates if not pd.isna(d)]
+            if tx_dates:
+                starts.append(min(tx_dates)); ends.append(max(tx_dates))
+
     if lazada_result:
-        for key in ["period_start", "period_end", "write_date"]:
-            if lazada_result.get(key):
-                values.append(lazada_result[key])
+        _add(lazada_result.get("period_start"), lazada_result.get("period_end"))
+
     if qoo10_result:
-        for key in ["period_start", "period_end", "write_date"]:
-            if qoo10_result.get(key):
-                values.append(qoo10_result[key])
-        for e in qoo10_result.get("entries", []):
-            for key in ["period_start", "period_end", "write_date"]:
-                if e.get(key):
-                    values.append(e[key])
-    parsed = []
-    for v in values:
-        dt = pd.to_datetime(str(v).replace(".", "-"), errors="coerce")
-        if not pd.isna(dt):
-            parsed.append(dt.normalize())
-    return parsed
+        _add(qoo10_result.get("period_start"), qoo10_result.get("period_end"))
+        for entry in qoo10_result.get("entries", []):
+            _add(entry.get("period_start"), entry.get("period_end"))
+
+    if not starts and not ends:
+        return None, None
+    display_start = min(starts or ends)
+    display_end = max(ends or starts)
+    return display_start, display_end
 
 
 def _build_qoo10_result():
     entries = list(st.session_state.qoo10_entries)
     if not entries:
         return None
+    submitter = next((e.get("_submitter") for e in entries if (e.get("_submitter") or {}).get("name")), {})
     return {
+        "submitter": submitter,
         "type": "qoo10",
         "carrier": "국제로지스틱",
         "destination": "JP",
@@ -394,9 +467,14 @@ if process_btn:
                 selected_type = uploaded_type_choices.get(p.name, detect_pdf_type(p.name))
                 forced_type = selected_type if detect_pdf_type(p.name) == "unknown" else None
                 detected_type = forced_type or detect_pdf_type(p.name)
-                # 큐텐은 STEP 2 수동 입력을 사용하므로 PDF OCR은 생략합니다.
+                # 큐텐 PDF는 업로드 단계에서 파싱되어 STEP 2 목록에 자동 반영됩니다.
                 if detected_type == "qoo10":
-                    log(f"[SKIP] 큐텐재팬 PDF: {p.name} / STEP 2 수동 입력 사용")
+                    matched = [e for e in st.session_state.qoo10_entries if e.get("_source_file") == p.name]
+                    if matched:
+                        e = matched[0]
+                        log(f"[OK] 큐텐재팬: {p.name} / {int(e.get('qty', 0)):,}건 / {int(e.get('amount', 0)):,} JPY")
+                    else:
+                        log(f"[WARN] 큐텐재팬 PDF 자동입력 실패: {p.name} / STEP 2에서 직접 입력")
                     continue
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
@@ -416,7 +494,7 @@ if process_btn:
 
             qoo10_result = _build_qoo10_result()
             if qoo10_result:
-                log(f"[OK] 큐텐 수동 입력: {len(qoo10_result.get('entries', [])):,}건 / {int(qoo10_result.get('amount',0)):,} JPY")
+                log(f"[OK] 큐텐 STEP 2: {len(qoo10_result.get('entries', [])):,}건 / {int(qoo10_result.get('amount',0)):,} JPY")
 
             if not shopee_results and not lazada_result and not qoo10_result and not ebay_results:
                 raise RuntimeError("처리할 데이터가 없습니다. PDF 또는 큐텐 수동 입력을 확인해 주세요.")
@@ -425,20 +503,23 @@ if process_btn:
             # 환율 수집
             daily_needed = _needed_currencies(shopee_results, lazada_result, qoo10_result)
             monthly_needed = _needed_monthly_currencies(ebay_results)
-            date_values = _date_values_for_rates(shopee_results, lazada_result, qoo10_result)
-            if not date_values:
+            display_start, display_end = _daily_rate_period_bounds(shopee_results, lazada_result, qoo10_result)
+            if display_start is None or display_end is None:
                 today = pd.Timestamp.today().normalize()
-                rate_start = today - pd.Timedelta(days=RATE_LOOKBACK_DAYS)
-                rate_end = today
-            else:
-                rate_start = min(date_values) - pd.Timedelta(days=RATE_LOOKBACK_DAYS)
-                rate_end = max(date_values)
+                display_start = today
+                display_end = today
+            # 1월 1일 등 휴일의 직전 영업일 환율을 확보하기 위해 7일 앞에서부터 수집합니다.
+            rate_start = display_start - pd.Timedelta(days=RATE_LOOKBACK_DAYS)
+            rate_end = display_end
 
             t_rate = time.perf_counter()
             progress_bar.progress(45, text="💱 환율 확인 중...")
             rates = {}
             if daily_needed:
-                rates = fetch_all_currencies_for_period(rate_start, rate_end, daily_needed, logger=log)
+                rates = fetch_all_currencies_for_period(
+                    rate_start, rate_end, daily_needed, logger=log,
+                    display_start=display_start, display_end=display_end,
+                )
             months_needed = _month_values_for_monthly_rates(ebay_results)
             if monthly_needed and months_needed:
                 monthly_rates = fetch_monthly_avg_currencies_for_period(
@@ -537,7 +618,7 @@ with st.expander("📌 파일명 규칙 안내"):
 | `유엠(UM)_TW_*.pdf` | 쇼피 대만 |
 | `유엠(UM)_VN_*.pdf` | 쇼피 베트남 |
 | `라자다_*.pdf` | 라자다 |
-| `큐텐재팬_*.pdf` | 큐텐재팬 — STEP 2에서 수동 입력 |
+| `큐텐재팬_*.pdf` | 큐텐재팬 — PDF 자동인식 후 STEP 2에 반영 |
 
 참고: 쇼피는 업체명과 무관하게 `_MY_`, `_PH_`, `_SG_`, `_TH_`, `_TW_`, `_VN_`, `_BR_`, `_MX_` 국가코드 패턴도 함께 인식합니다.
 """
