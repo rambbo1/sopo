@@ -785,7 +785,12 @@ def write_summary_sheet(ws, shopee_totals: dict, lazada_totals: dict,
                          qoo10_data: Optional[dict], jpy_rate: float,
                          year_month: str, submitter: dict = None,
                          ebay_totals: dict = None):
-    """총집계 시트 작성 (B열부터, 통화 개수에 맞춰 자동 배치)"""
+    """총집계 시트 작성.
+
+    실제 집계된 플랫폼만 표시합니다. 예를 들어 이베이 자료만 처리한 경우
+    쇼피/라자다/큐텐 구역은 만들지 않습니다. 각 플랫폼 안에서도 실제로
+    집계된 통화만 행으로 출력합니다.
+    """
     NUM  = '#,##0'
     NUM2 = '#,##0.00'
     ws.column_dimensions['B'].width = 16
@@ -831,65 +836,83 @@ def write_summary_sheet(ws, shopee_totals: dict, lazada_totals: dict,
         'CAD': '캐나다(CAD)', 'AUD': '호주(AUD)',
     }
 
-    # 쇼피 (제목 5행, 헤더 6행, 데이터 7행~)
-    _sub(5, '쇼피')
-    _hdr3(6, '국가', '외화', '원화')
-    r = 7
-    shopee_total_krw = 0
-    for cur, name in COUNTRY_NAMES.items():
-        data = shopee_totals.get(cur, {})
-        fx = data.get('fx', 0.0); krw = data.get('krw', 0)
-        shopee_total_krw += krw
-        _datarow(r, name, fx, krw)
-        r += 1
-    _totalrow(r, shopee_total_krw)
-
-    # 라자다
-    rr = r + 2
-    _sub(rr, '라자다')
-    _hdr3(rr + 1, '국가', '외화', '원화')
-    dr = rr + 2
-    lazada_total_krw = 0
-    for cur in ['MYR', 'PHP', 'SGD', 'VND']:
-        data = lazada_totals.get(cur, {})
-        fx = data.get('fx', 0.0); krw = data.get('krw', 0)
-        lazada_total_krw += krw
-        _datarow(dr, COUNTRY_NAMES.get(cur, cur), fx, krw)
-        dr += 1
-    _totalrow(dr, lazada_total_krw)
-
-    # 이베이/린코스
+    # 실제 집계된 통화만 대상으로 삼습니다. totals 딕셔너리는 실제 입력
+    # 자료가 있을 때만 통화 키가 생성되므로 값이 0인 정상 거래도 유지됩니다.
+    shopee_totals = shopee_totals or {}
+    lazada_totals = lazada_totals or {}
     ebay_totals = ebay_totals or {}
-    erow = dr + 2
-    _sub(erow, '이베이')
-    _hdr3(erow + 1, '통화', '외화', '원화')
-    edr = erow + 2
-    ebay_total_krw = 0
-    for cur in _ordered_currencies(ebay_totals.keys()):
-        data = ebay_totals.get(cur, {})
-        fx = data.get('fx', 0.0); krw = data.get('krw', 0)
-        ebay_total_krw += krw
-        _datarow(edr, COUNTRY_NAMES.get(cur, cur), fx, krw)
-        edr += 1
-    _totalrow(edr, ebay_total_krw)
 
-    # 큐텐
-    qt = edr + 2
-    _sub(qt, '큐텐')
-    _hdr3(qt + 1, '외화', '평균환율', '원화')
+    row = 5
+    written_platforms = 0
+
+    if shopee_totals:
+        _sub(row, '쇼피')
+        _hdr3(row + 1, '국가', '외화', '원화')
+        data_row = row + 2
+        total_krw = 0
+        for cur in _ordered_currencies(shopee_totals.keys()):
+            data = shopee_totals.get(cur, {})
+            fx = data.get('fx', 0.0)
+            krw = data.get('krw', 0)
+            total_krw += krw
+            _datarow(data_row, COUNTRY_NAMES.get(cur, cur), fx, krw)
+            data_row += 1
+        _totalrow(data_row, total_krw)
+        row = data_row + 2
+        written_platforms += 1
+
+    if lazada_totals:
+        _sub(row, '라자다')
+        _hdr3(row + 1, '국가', '외화', '원화')
+        data_row = row + 2
+        total_krw = 0
+        for cur in _ordered_currencies(lazada_totals.keys()):
+            data = lazada_totals.get(cur, {})
+            fx = data.get('fx', 0.0)
+            krw = data.get('krw', 0)
+            total_krw += krw
+            _datarow(data_row, COUNTRY_NAMES.get(cur, cur), fx, krw)
+            data_row += 1
+        _totalrow(data_row, total_krw)
+        row = data_row + 2
+        written_platforms += 1
+
+    if ebay_totals:
+        _sub(row, '이베이')
+        _hdr3(row + 1, '통화', '외화', '원화')
+        data_row = row + 2
+        total_krw = 0
+        for cur in _ordered_currencies(ebay_totals.keys()):
+            data = ebay_totals.get(cur, {})
+            fx = data.get('fx', 0.0)
+            krw = data.get('krw', 0)
+            total_krw += krw
+            _datarow(data_row, COUNTRY_NAMES.get(cur, cur), fx, krw)
+            data_row += 1
+        _totalrow(data_row, total_krw)
+        row = data_row + 2
+        written_platforms += 1
+
     if qoo10_data:
+        _sub(row, '큐텐')
+        _hdr3(row + 1, '외화', '평균환율', '원화')
         jpy_amount = qoo10_data.get('amount', 0)
         krw = qoo10_data.get('total_krw') or round(jpy_amount * jpy_rate / 100)
         # 평균환율 = 실효환율(원화÷외화×100) — 외화·원화와 정확히 일치
         eff_rate = round(krw * 100 / jpy_amount, 2) if jpy_amount else jpy_rate
-        qd = qt + 2
-        ws.cell(row=qd, column=2, value=jpy_amount)
-        ws.cell(row=qd, column=3, value=eff_rate)
-        ws.cell(row=qd, column=4, value=krw)
-        _style(ws.cell(row=qd, column=2), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM)
-        _style(ws.cell(row=qd, column=3), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM2)
-        _style(ws.cell(row=qd, column=4), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM)
+        data_row = row + 2
+        ws.cell(row=data_row, column=2, value=jpy_amount)
+        ws.cell(row=data_row, column=3, value=eff_rate)
+        ws.cell(row=data_row, column=4, value=krw)
+        _style(ws.cell(row=data_row, column=2), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM)
+        _style(ws.cell(row=data_row, column=3), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM2)
+        _style(ws.cell(row=data_row, column=4), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM)
+        written_platforms += 1
 
+    # 방어 로직: 데이터 없는 상태에서도 워크북 구조가 깨지지 않게 안내만 표시합니다.
+    if written_platforms == 0:
+        ws['B5'] = '집계된 플랫폼이 없습니다.'
+        _style(ws['B5'], font=FONT_DEFAULT)
 
 
 
