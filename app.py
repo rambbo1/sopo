@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-소포수령증 자동화 웹앱 — v47 큐텐 반기말 월평균환율 표시
+소포수령증 자동화 웹앱 — v48 큐텐 월평균환율 적용
 실행: streamlit run app.py
 """
 
@@ -307,7 +307,7 @@ st.markdown("### ✅ STEP 3 — 생성할 문서 선택")
 cc1, cc2, cc3 = st.columns(3)
 make_sales = cc1.checkbox("매출집계", value=True)
 make_zero = cc2.checkbox("영세율첨부서류제출명세서", value=True)
-make_export = cc3.checkbox("수출실적명세서", value=True)
+make_export = cc3.checkbox("수출실적명세서", value=False)
 
 zero_doc_mode = "전체"
 if make_zero:
@@ -353,8 +353,9 @@ def _needed_currencies(shopee_results, lazada_result, qoo10_result):
         for it in lazada_result.get("items", []):
             if it.get("currency"):
                 used.add(it["currency"])
-    if qoo10_result:
-        used.add("JPY")
+    # 큐텐재팬은 일별/기간평균 환율을 사용하지 않고 반기말(6월/12월)의
+    # 서울외국환중개 공식 월평균 매매기준율만 사용합니다.
+    # 따라서 큐텐 때문에 JPY 일별 환율을 별도로 수집하지 않습니다.
     return sorted(used)
 
 
