@@ -261,6 +261,41 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
                 num_format=NUM_FMT2 if col in (3, 4) else None,
             )
 
+    # 일별 환율과 함께 공식 월평균 환율이 있는 경우(큐텐재팬 등),
+    # 시트 상단 오른쪽에 반기말 월평균 환율을 별도 표로 표시합니다.
+    monthly_rows = list(rate_data.get('monthly', []) or [])
+    if monthly_rows:
+        ws.column_dimensions['I'].width = 14
+        ws.column_dimensions['J'].width = 22
+        ws.column_dimensions['K'].width = 18
+
+        ws.merge_cells(start_row=4, start_column=9, end_row=4, end_column=11)
+        title_cell = ws.cell(row=4, column=9, value='월평균 매매기준율')
+        _style(title_cell, font=FONT_BOLD, fill=SUBHEAD_FILL, align=CENTER, border=THIN_BORDER)
+        for col in range(9, 12):
+            ws.cell(row=4, column=col).border = THIN_BORDER
+
+        monthly_headers = ['년월', '통화명', '월평균환율']
+        for offset, header in enumerate(monthly_headers, 9):
+            c = ws.cell(row=5, column=offset, value=header)
+            _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
+
+        for row_no, item in enumerate(monthly_rows, 6):
+            values = [
+                item.get('year_month', ''),
+                rate_data.get('currency_name', ''),
+                round(float(item.get('rate', 0) or 0), 2),
+            ]
+            for offset, value in enumerate(values, 9):
+                c = ws.cell(row=row_no, column=offset, value=value)
+                _style(
+                    c,
+                    font=FONT_DEFAULT,
+                    align=CENTER if offset != 10 else LEFT,
+                    border=THIN_BORDER,
+                    num_format=NUM_FMT2 if offset == 11 else None,
+                )
+
 
 # ── 쇼피 소포수령증 시트 작성 ───────────────────────────────────
 
