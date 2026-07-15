@@ -186,7 +186,7 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
         ws['A1'] = '환율 데이터 없음 (수동 입력 필요)'
         return
 
-    # 월평균 전용 데이터만 있는 경우(이베이/린코스)
+    # 월평균 전용 데이터만 있는 경우(이베이/큐텐재팬 등)
     if rate_data.get('monthly') and not rate_data.get('daily'):
         ws['A1'] = '월평균 매매기준율'
         _style(ws['A1'], font=FONT_BOLD)
@@ -738,7 +738,7 @@ def write_ebay_receipt_sheet(ws, ebay_data: dict, rates: dict, submitter: dict =
 def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter: dict = None):
     """
     큐텐(소포수령증) 시트
-    jpy_rate: 거래기간 마지막날 JPY 환율 (100엔 기준)
+    jpy_rate: 큐텐 반기말(6월/12월) 공식 월평균환율의 대표값 (100엔 기준)
     """
     ws['A1'] = '해외배송 소포 수령증'
     _style(ws['A1'], font=FONT_TITLE, align=CENTER)
@@ -792,7 +792,7 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
             'krw':    round(qoo10_data.get('amount', 0) * jpy_rate / 100),
         }]
 
-        ws.cell(row=18, column=8, value='적용: 거래기간 평균환율 (100엔)')
+        ws.cell(row=18, column=8, value='적용: 반기말 월평균환율 (100엔)')
 
         r = 19
         total_jpy = 0
@@ -1112,6 +1112,15 @@ def _qoo10_reporting_date(entry=None, result=None):
         return f"{year}-06-30" if month <= 6 else f"{year}-12-31"
     return ''
 
+def _qoo10_reporting_month(entry=None, result=None):
+    """큐텐 거래기간 기준 반기말 월(YYYY-06 또는 YYYY-12)을 반환합니다."""
+    report_date = _qoo10_reporting_date(entry, result)
+    digits = re.sub(r"\D", "", str(report_date or ""))[:8]
+    if len(digits) >= 6:
+        return f"{digits[:4]}-{digits[4:6]}"
+    return ""
+
+
 def _month_label_from_date(value):
     """날짜 문자열/숫자에서 'YYYY년 MM월' 라벨을 반환합니다."""
     d = re.sub(r"\D", "", str(value or ""))[:8]
@@ -1350,29 +1359,27 @@ def generate_excel(
             if _lc and _lc not in lazada_avg_rates:
                 lazada_avg_rates[_lc] = avg_rate_for_period(rates.get(_lc), _lp_s, _lp_e)
 
-    # ── 큐텐 JPY 환율: 거래기간 평균환율 사용 ──
+    # ── 큐텐 JPY 환율: 반기말(6월/12월) 공식 월평균 매매기준율 사용 ──
     jpy_rate_data = rates.get('JPY')
+    jpy_rate = 0.0
     if jpy_rate_data:
-        jpy_rate = jpy_rate_data.get('average', 0.0)
-        if jpy_rate == 0.0:
-            daily = jpy_rate_data.get('daily', [])
-            if daily:
-                jpy_rate = round(sum(d['rate'] for d in daily) / len(daily), 2)
-    else:
-        jpy_rate = 0.0
+        # 표시·폴백용 대표값. 실제 계산은 아래에서 건별 반기말 월평균환율을 사용합니다.
+        monthly_values = [
+            round(float(row.get('rate', 0) or 0), 2)
+            for row in (jpy_rate_data.get('monthly', []) or [])
+            if float(row.get('rate', 0) or 0) > 0
+        ]
+        if monthly_values:
+            jpy_rate = monthly_values[0]
+        else:
+            jpy_rate = round(float(jpy_rate_data.get('monthly_average', 0) or 0), 2)
+
     # 큐텐 신고/집계 기준일은 작성일이 아니라 거래기간 종료일입니다.
     qoo10_report_date = ''
     if qoo10_result:
         qoo10_report_date = _qoo10_reporting_date({}, qoo10_result)
-        # 큐텐 전체 거래기간 평균환율을 대표 환율로 사용 (표시·폴백용)
-        _qs = qoo10_result.get('period_start', '')
-        _qe = qoo10_result.get('period_end', '')
-        if (_qs or _qe) and jpy_rate_data:
-            _qavg = avg_rate_for_period(jpy_rate_data, _qs, _qe)
-            if _qavg:
-                jpy_rate = _qavg
 
-        # ── 큐텐 건별 환율·원화 계산 (entries) ──
+        # ── 큐텐 건별 월평균환율·원화 계산 (entries) ──
         q_entries = qoo10_result.get('entries')
         if not q_entries:
             q_entries = [{
@@ -1385,16 +1392,20 @@ def generate_excel(
             }]
         q_total_krw = 0
         for e in q_entries:
-            ps = e.get('period_start', '') or qoo10_result.get('period_start', '')
-            pe = e.get('period_end', '') or qoo10_result.get('period_end', '')
-            r = avg_rate_for_period(jpy_rate_data, ps, pe) or jpy_rate
-            e['rate'] = r
-            e['krw']  = round(e.get('amount', 0) * r / 100)
+            report_month = _qoo10_reporting_month(e, qoo10_result)
+            r = monthly_avg_rate_for_month(jpy_rate_data, report_month)
+            e['rate'] = round(r, 2)
+            e['rate_month'] = report_month
+            e['rate_source'] = 'SMBS_MON_AVG_OFFICIAL'
+            e['krw'] = round(float(e.get('amount', 0) or 0) * e['rate'] / 100)
             q_total_krw += e['krw']
-        qoo10_result['entries']   = q_entries
-        qoo10_result['amount']    = sum(e.get('amount', 0) for e in q_entries)
-        qoo10_result['qty']       = sum(e.get('qty', 0) for e in q_entries)
+        qoo10_result['entries'] = q_entries
+        qoo10_result['amount'] = sum(float(e.get('amount', 0) or 0) for e in q_entries)
+        qoo10_result['qty'] = sum(int(e.get('qty', 0) or 0) for e in q_entries)
         qoo10_result['total_krw'] = q_total_krw
+        # 여러 반기 자료가 함께 있으면 총집계 표시는 외화금액 가중 실효환율로 표시합니다.
+        if qoo10_result['amount']:
+            jpy_rate = round(q_total_krw * 100 / qoo10_result['amount'], 2)
 
     # ── 제출자(판매자) 정보: PDF에서 자동 추출, 없으면 기본값 ──
     report_submitter = None

@@ -188,10 +188,10 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, e
             "period_end": qoo10_result.get("period_end", ""),
         }]
         for e in q_entries:
-            ps = e.get("period_start", "") or qoo10_result.get("period_start", "")
-            pe = e.get("period_end", "") or qoo10_result.get("period_end", "")
             report_date = qoo10_reporting_date(e, qoo10_result)
-            rate = avg_rate_for_period(rates.get("JPY"), ps, pe)
+            report_digits = re.sub(r"\D", "", str(report_date or ""))[:8]
+            report_month = f"{report_digits[:4]}-{report_digits[4:6]}" if len(report_digits) >= 6 else ""
+            rate = monthly_avg_rate_for_month(rates.get("JPY"), report_month)
             amount = float(e.get("amount", 0) or 0)
             krw = round(amount * rate / 100)
             tracking = e.get("tracking_no", "") or qoo10_result.get("tracking_no", "")
