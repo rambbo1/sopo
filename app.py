@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-소포수령증 자동화 웹앱 — v45 큐텐 PDF 자동입력 및 환율 조회기간 보완
+소포수령증 자동화 웹앱 — v47 큐텐 반기말 월평균환율 표시
 실행: streamlit run app.py
 """
 
@@ -359,23 +359,72 @@ def _needed_currencies(shopee_results, lazada_result, qoo10_result):
 
 
 
-def _needed_monthly_currencies(ebay_results):
-    used = set()
-    for er in ebay_results or []:
-        for it in er.get("items", []):
-            if it.get("currency"):
-                used.add(it["currency"])
-    return sorted(used)
+def _qoo10_reporting_month(entry=None, result=None):
+    """큐텐 거래기간 기준 반기말 월(YYYY-06 또는 YYYY-12)을 반환합니다."""
+    entry = entry or {}
+    result = result or {}
+
+    period_end = entry.get("period_end") or result.get("period_end") or ""
+    digits = re.sub(r"\D", "", str(period_end))[:8]
+    if len(digits) >= 6:
+        year = digits[:4]
+        month = int(digits[4:6])
+        return f"{year}-06" if month <= 6 else f"{year}-12"
+
+    base = (
+        entry.get("period_start") or result.get("period_start")
+        or entry.get("write_date") or result.get("write_date") or ""
+    )
+    digits = re.sub(r"\D", "", str(base))[:8]
+    if len(digits) >= 6:
+        year = digits[:4]
+        month = int(digits[4:6])
+        return f"{year}-06" if month <= 6 else f"{year}-12"
+    return ""
 
 
-def _month_values_for_monthly_rates(ebay_results):
-    months = []
+def _monthly_rate_requests(ebay_results, qoo10_result):
+    """통화별로 공식 월평균 환율이 필요한 월 목록을 만듭니다."""
+    requests = {}
+
+    # 이베이: PDF의 실제 발행월별 월평균 환율
     for er in ebay_results or []:
         for it in er.get("items", []):
+            currency = str(it.get("currency", "")).strip().upper()
             month_value = str(it.get("month", "")).strip()
-            if re.fullmatch(r"20\d{2}-\d{2}", month_value):
-                months.append(month_value)
-    return sorted(set(months))
+            if currency and re.fullmatch(r"20\d{2}-\d{2}", month_value):
+                requests.setdefault(currency, set()).add(month_value)
+
+    # 큐텐재팬: 거래기간이 속한 반기의 말월(6월 또는 12월) 월평균 환율
+    if qoo10_result:
+        entries = qoo10_result.get("entries") or [{}]
+        for entry in entries:
+            month_value = _qoo10_reporting_month(entry, qoo10_result)
+            if month_value:
+                requests.setdefault("JPY", set()).add(month_value)
+
+    return {currency: sorted(months) for currency, months in requests.items() if months}
+
+
+def _filter_monthly_rate_data(rate_data, requested_months):
+    """조회 구간 중 실제 필요한 월만 환율 시트에 남깁니다."""
+    wanted = set(requested_months or [])
+    filtered = [
+        row for row in (rate_data.get("monthly", []) or [])
+        if str(row.get("year_month", "")) in wanted
+    ]
+    values = [float(row.get("rate", 0) or 0) for row in filtered if float(row.get("rate", 0) or 0) > 0]
+    result = dict(rate_data or {})
+    result["monthly"] = filtered
+    result["period"] = (
+        f"{requested_months[0]} ~ {requested_months[-1]}" if requested_months else ""
+    )
+    result["average"] = round(sum(values) / len(values), 2) if values else 0.0
+    result["monthly_average"] = result["average"]
+    result["min"] = min(values) if values else 0.0
+    result["max"] = max(values) if values else 0.0
+    result["range"] = round(max(values) - min(values), 2) if values else 0.0
+    return result
 
 def _daily_rate_period_bounds(shopee_results, lazada_result, qoo10_result):
     """실제 신고기간의 시작/종료일을 반환합니다. 작성일은 환율시트 기간에 포함하지 않습니다."""
@@ -502,7 +551,7 @@ if process_btn:
 
             # 환율 수집
             daily_needed = _needed_currencies(shopee_results, lazada_result, qoo10_result)
-            monthly_needed = _needed_monthly_currencies(ebay_results)
+            monthly_requests = _monthly_rate_requests(ebay_results, qoo10_result)
             display_start, display_end = _daily_rate_period_bounds(shopee_results, lazada_result, qoo10_result)
             if display_start is None or display_end is None:
                 today = pd.Timestamp.today().normalize()
@@ -520,12 +569,21 @@ if process_btn:
                     rate_start, rate_end, daily_needed, logger=log,
                     display_start=display_start, display_end=display_end,
                 )
-            months_needed = _month_values_for_monthly_rates(ebay_results)
-            if monthly_needed and months_needed:
-                monthly_rates = fetch_monthly_avg_currencies_for_period(
-                    months_needed[0], months_needed[-1], monthly_needed, logger=log
-                )
+            if monthly_requests:
+                requested_currencies = sorted(monthly_requests)
+                log(f"💱 월평균 환율 확인 중... ({', '.join(requested_currencies)})")
+                monthly_rates = {}
+                silent_logger = lambda _msg: None
+                for currency in requested_currencies:
+                    requested_months = monthly_requests[currency]
+                    fetched = fetch_monthly_avg_currencies_for_period(
+                        requested_months[0], requested_months[-1], [currency], logger=silent_logger
+                    )
+                    monthly_rates[currency] = _filter_monthly_rate_data(
+                        fetched[currency], requested_months
+                    )
                 rates = merge_monthly_rates(rates, monthly_rates)
+                log("✅ 월평균 환율 확인 완료")
             log(f"✅ 환율 확인 완료 ({time.perf_counter() - t_rate:.1f}초)")
 
             # 출력 라벨/파일명
