@@ -44,7 +44,9 @@ DEFAULT_SUBMITTER = {
 
 # 숫자 천단위 콤마 서식
 NUM_FMT  = '#,##0'        # 정수(수량·원화)
-NUM_FMT2 = '#,##0.00'     # 소수(외화·환율)
+NUM_FMT2 = '#,##0.00'     # 일반 소수/환율
+NUM_FMT4 = '#,##0.0000'   # JPY·IDR·VND 1통화 단위 적용환율
+HUNDRED_UNIT_CURRENCIES = {'JPY', 'IDR', 'VND'}
 
 # L/C 번호 또는 수출신고번호에는 운송장번호를 넣지 않습니다.
 # 영세율 증빙은 기타영세율건수 1로 신고합니다.
@@ -60,6 +62,29 @@ def other_zero_rate_count_value(value=None):
 def _date_to_int(value):
     d = re.sub(r"\D", "", str(value or ""))[:8]
     return int(d) if len(d) == 8 else None
+
+
+def _applied_rate_format(currency: str) -> str:
+    return NUM_FMT4 if str(currency or '').upper() in HUNDRED_UNIT_CURRENCIES else NUM_FMT2
+
+
+def _smbs_display_rate(currency: str, value):
+    """환율(통화) 시트 표시용: JPY/IDR/VND는 서울외국환중개 100통화 단위로 복원."""
+    if value in (None, ''):
+        return value
+    try:
+        multiplier = 100.0 if str(currency or '').upper() in HUNDRED_UNIT_CURRENCIES else 1.0
+        return float(value) * multiplier
+    except (TypeError, ValueError):
+        return value
+
+
+def _exchange_currency_name(currency: str, name: str) -> str:
+    cur = str(currency or '').upper()
+    text = str(name or cur)
+    if cur in HUNDRED_UNIT_CURRENCIES and '(100)' not in text:
+        return f'{text} (100)'
+    return text
 
 
 
@@ -170,18 +195,28 @@ def _get_rate(rates: dict, currency: str, date_str: str) -> float:
 # ── 환율 시트 작성 ──────────────────────────────────────────────
 
 def write_exchange_rate_sheet(ws, rate_data: dict):
-    """환율(XXX) 시트를 SMBS 데이터로 채움"""
+    """환율(XXX) 시트를 SMBS 원문 표시단위로 작성합니다.
+
+    내부 계산값은 1통화 단위이지만 JPY/IDR/VND는 이 시트에서만
+    서울외국환중개와 동일하게 100통화 단위 환율로 다시 표시합니다.
+    """
     ws.column_dimensions['A'].width = 14
-    ws.column_dimensions['B'].width = 22
-    ws.column_dimensions['C'].width = 10
-    ws.column_dimensions['D'].width = 10
+    ws.column_dimensions['B'].width = 24
+    ws.column_dimensions['C'].width = 12
+    ws.column_dimensions['D'].width = 12
     ws.column_dimensions['E'].width = 10
-    ws.column_dimensions['F'].width = 10
+    ws.column_dimensions['F'].width = 12
     ws.column_dimensions['G'].width = 12
 
     if rate_data is None:
         ws['A1'] = '환율 데이터 없음 (수동 입력 필요)'
         return
+
+    currency = str(rate_data.get('currency', '') or '').upper()
+    currency_name = _exchange_currency_name(currency, rate_data.get('currency_name', ''))
+
+    def src(value):
+        return _smbs_display_rate(currency, value)
 
     # 월평균 전용 데이터만 있는 경우(이베이/큐텐재팬 등)
     if rate_data.get('monthly') and not rate_data.get('daily'):
@@ -193,7 +228,7 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
             c = ws.cell(row=4, column=col, value=h)
             _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
         for r, d in enumerate(rate_data.get('monthly', []), 5):
-            vals = [d.get('year_month', ''), rate_data.get('currency_name', ''), round(float(d.get('rate', 0) or 0), 2)]
+            vals = [d.get('year_month', ''), currency_name, round(float(src(d.get('rate', 0)) or 0), 2)]
             for col, v in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col, value=v)
                 _style(
@@ -202,12 +237,10 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
                 )
         return
 
-    # 제목
     ws['A1'] = '기간별 매매기준율'
     _style(ws['A1'], font=FONT_BOLD)
     ws['A2'] = f"기간 : {rate_data['period']}"
 
-    # 평균환율 통계
     ws['A4'] = '평균환율'
     _style(ws['A4'], font=FONT_BOLD)
 
@@ -217,12 +250,12 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
         _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
 
     vals6 = [
-        rate_data.get('average', ''),
-        rate_data.get('min', ''),
+        src(rate_data.get('average', '')),
+        src(rate_data.get('min', '')),
         rate_data.get('min_date', ''),
-        rate_data.get('max', ''),
+        src(rate_data.get('max', '')),
         rate_data.get('max_date', ''),
-        rate_data.get('range', ''),
+        src(rate_data.get('range', '')),
         rate_data.get('cross_rate', ''),
     ]
     for col, v in enumerate(vals6, 1):
@@ -232,7 +265,6 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
             num_format=NUM_FMT2 if col in (1, 2, 4, 6, 7) and isinstance(v, (int, float)) else None,
         )
 
-    # 일별
     ws['A7'] = '일별 매매기준율'
     _style(ws['A7'], font=FONT_BOLD)
 
@@ -250,7 +282,7 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
         daily_rows = [d for d in daily_rows if str(d.get('date', '')) <= display_end]
 
     for r, d in enumerate(daily_rows, 10):
-        vals = [d['date'], rate_data.get('currency_name', ''), d['rate'], d['change'], d['cross']]
+        vals = [d['date'], currency_name, src(d['rate']), src(d['change']), d['cross']]
         for col, v in enumerate(vals, 1):
             c = ws.cell(row=r, column=col, value=v)
             _style(
@@ -258,12 +290,10 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
                 num_format=NUM_FMT2 if col in (3, 4) else None,
             )
 
-    # 일별 환율과 함께 공식 월평균 환율이 있는 경우(큐텐재팬 등),
-    # 시트 상단 오른쪽에 반기말 월평균 환율을 별도 표로 표시합니다.
     monthly_rows = list(rate_data.get('monthly', []) or [])
     if monthly_rows:
         ws.column_dimensions['I'].width = 14
-        ws.column_dimensions['J'].width = 22
+        ws.column_dimensions['J'].width = 24
         ws.column_dimensions['K'].width = 18
 
         ws.merge_cells(start_row=4, start_column=9, end_row=4, end_column=11)
@@ -280,8 +310,8 @@ def write_exchange_rate_sheet(ws, rate_data: dict):
         for row_no, item in enumerate(monthly_rows, 6):
             values = [
                 item.get('year_month', ''),
-                rate_data.get('currency_name', ''),
-                round(float(item.get('rate', 0) or 0), 2),
+                currency_name,
+                round(float(src(item.get('rate', 0)) or 0), 2),
             ]
             for offset, value in enumerate(values, 9):
                 c = ws.cell(row=row_no, column=offset, value=value)
@@ -419,7 +449,7 @@ def write_shopee_sheet(ws, shopee_data: dict, rates: dict, submitter: dict = Non
         _merge_row(ws, row, _RECEIPT_GROUPS_3, border=THIN_BORDER)
         for col in [1, 4, 7, 11, 13, 16, 18, 19]:
             c = ws.cell(row=row, column=col)
-            nf = {13: NUM_FMT, 16: NUM_FMT2, 18: NUM_FMT2, 19: NUM_FMT}.get(col)
+            nf = {13: NUM_FMT, 16: NUM_FMT2, 18: _applied_rate_format(currency), 19: NUM_FMT}.get(col)
             _style(c, font=FONT_DEFAULT, align=CENTER if col != 1 else LEFT, border=THIN_BORDER, num_format=nf)
 
         row += 1
@@ -563,7 +593,7 @@ def write_currency_template_sheet(ws, currency: str,
         row_vals = ['', 1, date_int, currency, tx_rate, amount, krw]
         for col, v in enumerate(row_vals, 1):
             c = ws.cell(row=data_row, column=col, value=v)
-            nf = {5: NUM_FMT2, 6: NUM_FMT2, 7: NUM_FMT}.get(col)
+            nf = {5: _applied_rate_format(currency), 6: NUM_FMT2, 7: NUM_FMT}.get(col)
             _style(c, font=FONT_DEFAULT, align=CENTER, border=THIN_BORDER, num_format=nf)
         data_row += 1
 
@@ -574,7 +604,7 @@ def write_currency_template_sheet(ws, currency: str,
         row_vals = ['', 1, date_int_laz, currency, lazada_rate, it['amount'], krw]
         for col, v in enumerate(row_vals, 1):
             c = ws.cell(row=data_row, column=col, value=v)
-            nf = {5: NUM_FMT2, 6: NUM_FMT2, 7: NUM_FMT}.get(col)
+            nf = {5: _applied_rate_format(currency), 6: NUM_FMT2, 7: NUM_FMT}.get(col)
             _style(c, font=FONT_DEFAULT, align=CENTER, border=THIN_BORDER, num_format=nf)
         data_row += 1
 
@@ -588,7 +618,7 @@ def write_currency_template_sheet(ws, currency: str,
         row_vals = ['', 1, date_int_ebay, currency, rate, amount, krw]
         for col, v in enumerate(row_vals, 1):
             c = ws.cell(row=data_row, column=col, value=v)
-            nf = {5: NUM_FMT2, 6: NUM_FMT2, 7: NUM_FMT}.get(col)
+            nf = {5: _applied_rate_format(currency), 6: NUM_FMT2, 7: NUM_FMT}.get(col)
             _style(c, font=FONT_DEFAULT, align=CENTER, border=THIN_BORDER, num_format=nf)
         data_row += 1
 
@@ -727,7 +757,7 @@ def write_ebay_receipt_sheet(ws, ebay_data: dict, rates: dict, submitter: dict =
         vals = [item.get('month',''), item.get('carrier',''), item.get('service',''), cur, item.get('qty',0), amount, rate, krw]
         for c, v in enumerate(vals, 1):
             cell = ws.cell(row=r, column=c, value=v)
-            nf = {5: NUM_FMT, 6: NUM_FMT2, 7: NUM_FMT2, 8: NUM_FMT}.get(c)
+            nf = {5: NUM_FMT, 6: NUM_FMT2, 7: _applied_rate_format(cur), 8: NUM_FMT}.get(c)
             _style(cell, font=FONT_DEFAULT, align=CENTER if c not in [6,8] else RIGHT, border=THIN_BORDER, num_format=nf)
 
 # ── 큐텐 소포수령증 시트 ────────────────────────────────────────
@@ -776,7 +806,7 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
         _style(ws['A15'], font=FONT_BOLD)
         ws['A17'] = '발행사유'; ws['B17'] = '국제로지스틱을 통해 해외로 수출한 내역 증명'
 
-        detail_headers = ['판매처', '해외배송업체', '출발', '도착', '발송번호', '발송수량', '금액 (JPY)', '원화금액']
+        detail_headers = ['판매처', '해외배송업체', '출발', '도착', '발송번호', '발송수량', '금액 (JPY)', '적용환율', '원화금액']
         for col, h in enumerate(detail_headers, 1):
             c = ws.cell(row=18, column=col, value=h)
             _style(c, font=FONT_BOLD, fill=HEADER_FILL, align=CENTER, border=THIN_BORDER)
@@ -789,7 +819,7 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
             'krw':    round(qoo10_data.get('amount', 0) * jpy_rate),
         }]
 
-        ws.cell(row=18, column=8, value='적용: 반기말 월평균환율 (1엔 기준)')
+        ws.cell(row=17, column=8, value='반기말 월평균환율 (1엔 기준)')
 
         r = 19
         total_jpy = 0
@@ -807,9 +837,10 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
             ws.cell(row=r, column=5, value=e.get('tracking_no', ''))
             ws.cell(row=r, column=6, value=f"{e_qty} 건")
             ws.cell(row=r, column=7, value=e_amt)
-            ws.cell(row=r, column=8, value=e_krw)
-            for col in range(1, 9):
-                nf = NUM_FMT if col in (7, 8) else None
+            ws.cell(row=r, column=8, value=e_rate)
+            ws.cell(row=r, column=9, value=e_krw)
+            for col in range(1, 10):
+                nf = NUM_FMT if col in (7, 9) else (_applied_rate_format('JPY') if col == 8 else None)
                 _style(ws.cell(row=r, column=col), font=FONT_DEFAULT, align=CENTER, border=THIN_BORDER, num_format=nf)
             total_jpy += e_amt
             total_krw += e_krw
@@ -819,9 +850,10 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
         ws.cell(row=r, column=1, value='당기 해외배송 합계')
         ws.cell(row=r, column=6, value=f"{total_qty} 건")
         ws.cell(row=r, column=7, value=total_jpy)
-        ws.cell(row=r, column=8, value=total_krw)
-        for col in range(1, 9):
-            nf = NUM_FMT if col in (7, 8) else None
+        ws.cell(row=r, column=8, value=jpy_rate)
+        ws.cell(row=r, column=9, value=total_krw)
+        for col in range(1, 10):
+            nf = NUM_FMT if col in (7, 9) else (_applied_rate_format('JPY') if col == 8 else None)
             _style(ws.cell(row=r, column=col), font=FONT_BOLD, align=CENTER, border=THIN_BORDER, num_format=nf)
     else:
         ws['A12'] = '⚠️ 큐텐 데이터 없음 — STEP 2에서 수동 입력하세요'
@@ -1362,14 +1394,14 @@ def generate_excel(
     if jpy_rate_data:
         # 표시·폴백용 대표값. 실제 계산은 아래에서 건별 반기말 월평균환율을 사용합니다.
         monthly_values = [
-            round(float(row.get('rate', 0) or 0), 2)
+            round(float(row.get('rate', 0) or 0), 4)
             for row in (jpy_rate_data.get('monthly', []) or [])
             if float(row.get('rate', 0) or 0) > 0
         ]
         if monthly_values:
             jpy_rate = monthly_values[0]
         else:
-            jpy_rate = round(float(jpy_rate_data.get('monthly_average', 0) or 0), 2)
+            jpy_rate = round(float(jpy_rate_data.get('monthly_average', 0) or 0), 4)
 
     # 큐텐 신고/집계 기준일은 작성일이 아니라 거래기간 종료일입니다.
     qoo10_report_date = ''
@@ -1391,7 +1423,7 @@ def generate_excel(
         for e in q_entries:
             report_month = _qoo10_reporting_month(e, qoo10_result)
             r = monthly_avg_rate_for_month(jpy_rate_data, report_month)
-            e['rate'] = round(r, 2)
+            e['rate'] = round(r, 4)
             e['rate_month'] = report_month
             e['rate_source'] = 'SMBS_MON_AVG_OFFICIAL'
             e['krw'] = round(float(e.get('amount', 0) or 0) * e['rate'])
@@ -1402,7 +1434,7 @@ def generate_excel(
         qoo10_result['total_krw'] = q_total_krw
         # 여러 반기 자료가 함께 있으면 총집계 표시는 외화금액 가중 실효환율로 표시합니다.
         if qoo10_result['amount']:
-            jpy_rate = round(q_total_krw / qoo10_result['amount'], 2)
+            jpy_rate = round(q_total_krw / qoo10_result['amount'], 4)
 
     # ── 제출자(판매자) 정보: PDF에서 자동 추출, 없으면 기본값 ──
     report_submitter = None
@@ -1540,7 +1572,7 @@ def generate_excel(
             ws_jpy.cell(row=_jr, column=2, value=1)
             ws_jpy.cell(row=_jr, column=3, value=date_str or None)
             ws_jpy.cell(row=_jr, column=4, value='JPY')
-            ws_jpy.cell(row=_jr, column=5, value=e.get('rate', jpy_rate)).number_format = NUM_FMT2
+            ws_jpy.cell(row=_jr, column=5, value=e.get('rate', jpy_rate)).number_format = _applied_rate_format('JPY')
             ws_jpy.cell(row=_jr, column=6, value=e.get('amount', 0)).number_format = NUM_FMT
             ws_jpy.cell(row=_jr, column=7, value=e.get('krw', 0)).number_format = NUM_FMT
             _jr += 1

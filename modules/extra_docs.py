@@ -15,6 +15,13 @@ from openpyxl.utils import get_column_letter
 from .exchange_rate import get_rate_for_date, avg_rate_for_period, monthly_avg_rate_for_month
 
 RATE_DIVISOR = {}  # 환율은 exchange_rate에서 1통화 단위로 정규화됨
+HUNDRED_UNIT_CURRENCIES = {'JPY', 'IDR', 'VND'}
+RATE_FMT2 = '#,##0.00'
+RATE_FMT4 = '#,##0.0000'
+
+
+def applied_rate_format(currency: str) -> str:
+    return RATE_FMT4 if str(currency or '').upper() in HUNDRED_UNIT_CURRENCIES else RATE_FMT2
 TRACKING_NO_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{13}$", re.I)
 
 # 수출실적명세서/통화 시트의 수출신고번호는 공란, 기타영세율건수는 1로 신고합니다.
@@ -280,7 +287,7 @@ def create_export_performance(rows, output_dir: Path, company: str, base_dir: Op
         vals = [r["export_no"], r["other_count"], r["ship_date"], r["currency"], r["rate"], r["foreign"], r["krw"]]
         for c, v in enumerate(vals, 1):
             ws.cell(idx, c, v)
-        ws.cell(idx, 5).number_format = "#,##0.00"
+        ws.cell(idx, 5).number_format = applied_rate_format(r.get("currency"))
         ws.cell(idx, 6).number_format = "#,##0.00"
         ws.cell(idx, 7).number_format = "#,##0"
 
@@ -302,7 +309,8 @@ def _write_zero_sheet(ws, rows):
         ]
         for c, v in enumerate(vals, 1):
             ws.cell(idx, c, v)
-        for c in [9, 10, 12, 14]:
+        ws.cell(idx, 9).number_format = applied_rate_format(r.get("currency"))
+        for c in [10, 12, 14]:
             ws.cell(idx, c).number_format = "#,##0.00"
         for c in [11, 13, 15]:
             ws.cell(idx, c).number_format = "#,##0"

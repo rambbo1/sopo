@@ -43,7 +43,8 @@ _FIXED_RATE_JSON_CANDIDATES = [
 RATE_LOOKBACK_DAYS = 7
 
 # 서울외국환중개는 아래 통화를 100통화 단위로 고시합니다.
-# 앱/엑셀 내부에서는 모두 1통화 단위 원화환율로 정규화합니다.
+# 계산에는 1통화 단위 원화환율을 사용하되, 환율(통화) 시트에는
+# 서울외국환중개 원문과 동일한 100통화 단위 값을 표시합니다.
 SMBS_SOURCE_UNIT_DIVISOR = {
     "JPY": 100.0,
     "IDR": 100.0,
@@ -125,6 +126,27 @@ def normalize_smbs_rate(currency: str, value):
         return None
     divisor = SMBS_SOURCE_UNIT_DIVISOR.get(str(currency or "").upper(), 1.0)
     return float(rate) / float(divisor)
+
+
+def smbs_source_rate(currency: str, value):
+    """1통화 단위 내부 환율을 서울외국환중개 표시단위로 되돌립니다."""
+    rate = to_number(value)
+    if rate is None:
+        return None
+    multiplier = SMBS_SOURCE_UNIT_DIVISOR.get(str(currency or "").upper(), 1.0)
+    return float(rate) * float(multiplier)
+
+
+def applied_rate_precision(currency: str) -> int:
+    """100통화 단위 고시 통화는 1통화 환율을 소수점 넷째 자리까지 유지합니다."""
+    return 4 if str(currency or "").upper() in SMBS_SOURCE_UNIT_DIVISOR else 2
+
+
+def round_applied_rate(currency: str, value) -> float:
+    rate = to_number(value)
+    if rate is None:
+        return 0.0
+    return round(float(rate), applied_rate_precision(currency))
 
 
 def _normalize_rate_column(df: pd.DataFrame, currency: str) -> pd.DataFrame:
@@ -770,12 +792,12 @@ def _to_rate_entry(currency, raw_df, start_date, end_date, display_start=None, d
 
     return {
         **empty,
-        "average": round(sum(vals) / len(vals), 2) if vals else 0.0,
-        "min": round(min(vals), 2) if vals else 0.0,
+        "average": round_applied_rate(currency, sum(vals) / len(vals)) if vals else 0.0,
+        "min": round_applied_rate(currency, min(vals)) if vals else 0.0,
         "min_date": pd.to_datetime(stats.loc[min_idx, "date"]).strftime("%Y.%m.%d") if min_idx is not None else "",
-        "max": round(max(vals), 2) if vals else 0.0,
+        "max": round_applied_rate(currency, max(vals)) if vals else 0.0,
         "max_date": pd.to_datetime(stats.loc[max_idx, "date"]).strftime("%Y.%m.%d") if max_idx is not None else "",
-        "range": round(max(vals) - min(vals), 2) if vals else 0.0,
+        "range": round_applied_rate(currency, max(vals) - min(vals)) if vals else 0.0,
         "daily": daily,
     }
 
@@ -892,7 +914,7 @@ def avg_rate_for_period(rate_data: dict, start: str, end: str) -> float:
     right = bisect.bisect_right(dates, e)
     vals = [r for r in rates[left:right] if r and r > 0]
     if vals:
-        return round(sum(vals) / len(vals), 2)
+        return round_applied_rate(rate_data.get("currency", ""), sum(vals) / len(vals))
     return get_rate_for_date(rate_data, e) or float(rate_data.get("average", 0.0) or 0.0)
 
 
@@ -1377,12 +1399,12 @@ def _to_month_rate_entry(currency, raw_df, start_month, end_month):
         "period": f"{months[0] if months else ''} ~ {months[-1] if months else ''}",
         "currency": currency,
         "currency_name": CURRENCY_NAMES.get(currency, currency),
-        "average": round(sum(vals) / len(vals), 2) if vals else 0.0,
+        "average": round_applied_rate(currency, sum(vals) / len(vals)) if vals else 0.0,
         "min": min(vals) if vals else 0.0,
         "max": max(vals) if vals else 0.0,
         "min_date": "",
         "max_date": "",
-        "range": round(max(vals) - min(vals), 2) if vals else 0.0,
+        "range": round_applied_rate(currency, max(vals) - min(vals)) if vals else 0.0,
         "cross_rate": 0.0,
         "daily": [],
         "monthly": monthly,
@@ -1428,7 +1450,7 @@ def monthly_avg_rate_for_month(rate_data: dict, month_key: str) -> float:
         if parse_month_key(row.get("year_month")) == mk:
             rate = float(row.get("rate") or 0.0)
             if rate > 0:
-                return round(rate, 2)
+                return round_applied_rate(rate_data.get("currency", ""), rate)
     raise RuntimeError(
         f"서울외국환중개 공식 월평균 매매기준율이 없습니다: {mk}. "
         "일별 환율 평균으로 대체하지 않습니다."
