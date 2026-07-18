@@ -42,14 +42,23 @@ _FIXED_RATE_JSON_CANDIDATES = [
 ]
 RATE_LOOKBACK_DAYS = 7
 
+# 서울외국환중개는 아래 통화를 100통화 단위로 고시합니다.
+# 앱/엑셀 내부에서는 모두 1통화 단위 원화환율로 정규화합니다.
+SMBS_SOURCE_UNIT_DIVISOR = {
+    "JPY": 100.0,
+    "IDR": 100.0,
+    "VND": 100.0,
+}
+
 CURRENCY_NAMES = {
     "MYR": "말레이시아 링깃 (MYR)",
     "PHP": "필리핀 페소 (PHP)",
     "SGD": "싱가포르 달러 (SGD)",
     "THB": "태국 바트 (THB)",
     "TWD": "대만 달러 (TWD)",
-    "VND": "베트남 동 (VND) (100)",
-    "JPY": "일본 엔 (JPY) (100)",
+    "VND": "베트남 동 (VND)",
+    "JPY": "일본 엔 (JPY)",
+    "IDR": "인도네시아 루피아 (IDR)",
     "BRL": "브라질 헤알 (BRL)",
     "MXN": "멕시코 페소 (MXN)",
     "USD": "미국 달러 (USD)",
@@ -72,6 +81,7 @@ CURRENCY_KOREAN_KEYWORDS = {
     "MYR": ["말레이시아", "링깃", "MYR"],
     "PHP": ["필리핀", "페소", "PHP"],
     "VND": ["베트남", "동", "VND"],
+    "IDR": ["인도네시아", "루피아", "IDR"],
     "MXN": ["멕시코", "페소", "MXN"],
     "BRL": ["브라질", "헤알", "BRL"],
 }
@@ -102,6 +112,27 @@ def to_number(value):
         return float(s)
     except Exception:
         return None
+
+
+def normalize_smbs_rate(currency: str, value):
+    """SMBS 고시단위를 1통화 단위 원화환율로 변환합니다.
+
+    JPY/IDR/VND는 사이트에서 100통화 단위로 고시되므로 100으로 나눕니다.
+    그 외 통화는 원본 값을 그대로 사용합니다.
+    """
+    rate = to_number(value)
+    if rate is None:
+        return None
+    divisor = SMBS_SOURCE_UNIT_DIVISOR.get(str(currency or "").upper(), 1.0)
+    return float(rate) / float(divisor)
+
+
+def _normalize_rate_column(df: pd.DataFrame, currency: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["rate"] = out["rate"].apply(lambda v: normalize_smbs_rate(currency, v))
+    return out
 
 
 def parse_date(value):
@@ -716,6 +747,7 @@ def _to_rate_entry(currency, raw_df, start_date, end_date, display_start=None, d
 
     # 내부 계산용으로는 직전 영업일을 포함한 수집기간 전체를 보관합니다.
     filled = fill_missing_dates(raw_df, fetch_start, fetch_end)
+    filled = _normalize_rate_column(filled, currency)
     stats = filled[(filled["date"] >= display_start) & (filled["date"] <= display_end)].copy()
     if stats.empty:
         stats = filled.copy()
@@ -1324,6 +1356,7 @@ def _to_month_rate_entry(currency, raw_df, start_month, end_month):
     raw_df = raw_df.copy() if raw_df is not None else pd.DataFrame(columns=["year_month", "rate"])
     raw_df["year_month"] = raw_df.get("year_month", pd.Series(dtype=str)).apply(parse_month_key)
     raw_df["rate"] = raw_df.get("rate", pd.Series(dtype=float)).apply(to_number)
+    raw_df = _normalize_rate_column(raw_df, currency)
     raw_df = raw_df.dropna(subset=["year_month", "rate"])
     monthly = []
     vals = []

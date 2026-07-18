@@ -14,7 +14,7 @@ from typing import Optional
 # ── 통화 매핑 ──────────────────────────────────────────────────
 COUNTRY_TO_CURRENCY = {
     'MY': 'MYR', 'PH': 'PHP', 'SG': 'SGD',
-    'TH': 'THB', 'TW': 'TWD', 'VN': 'VND', 'JP': 'JPY',
+    'TH': 'THB', 'TW': 'TWD', 'VN': 'VND', 'ID': 'IDR', 'JP': 'JPY',
     'BR': 'BRL', 'MX': 'MXN',
     'US': 'USD', 'EU': 'EUR', 'GB': 'GBP', 'CA': 'CAD', 'AU': 'AUD',
 }
@@ -26,7 +26,8 @@ CURRENCY_NAMES_KR = {
     'THB': '태국 바트 (THB)',
     'TWD': '대만 달러 (TWD)',
     'VND': '베트남 동 (VND)',
-    'JPY': '일본 엔 (JPY) (100)',
+    'IDR': '인도네시아 루피아 (IDR)',
+    'JPY': '일본 엔 (JPY)',
     'USD': '미국 달러 (USD)',
     'EUR': '유로 (EUR)',
     'GBP': '영국 파운드 (GBP)',
@@ -37,7 +38,7 @@ CURRENCY_NAMES_KR = {
 # 파일명에서 국가코드 감지
 SHOPEE_FILE_PATTERNS = {
     '_MY_': 'MY', '_PH_': 'PH', '_SG_': 'SG',
-    '_TH_': 'TH', '_TW_': 'TW', '_VN_': 'VN',
+    '_TH_': 'TH', '_TW_': 'TW', '_VN_': 'VN', '_ID_': 'ID',
     '_BR_': 'BR', '_MX_': 'MX',
 }
 

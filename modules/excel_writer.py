@@ -33,11 +33,8 @@ CENTER = Alignment(horizontal='center', vertical='center', wrap_text=True)
 LEFT   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
 RIGHT  = Alignment(horizontal='right',  vertical='center')
 
-# SMBS 환율은 일부 통화가 100단위 기준 (원화 = 외화 × 환율 / 제수)
-RATE_DIVISOR = {
-    'JPY': 100,   # 100엔 기준
-    'VND': 100,   # 100동 기준
-}
+# exchange_rate 모듈에서 모든 환율을 1통화 단위로 정규화하므로 추가 제수는 없습니다.
+RATE_DIVISOR = {}
 
 # 제출자(판매자) 정보 기본값 — PDF에서 못 읽었을 때만 사용
 DEFAULT_SUBMITTER = {
@@ -312,7 +309,7 @@ def write_shopee_sheet(ws, shopee_data: dict, rates: dict, submitter: dict = Non
     carrier    = shopee_data.get('carrier', '주)두라로지스틱스')
     country    = shopee_data.get('country', '')
     period_end = shopee_data.get('period_end', '')
-    divisor    = RATE_DIVISOR.get(currency, 1)   # VND·JPY → 100, 나머지 → 1
+    divisor    = RATE_DIVISOR.get(currency, 1)
 
     # ── 행 1: 제목 헤더 ──
     sub = submitter or shopee_data.get('submitter') or DEFAULT_SUBMITTER
@@ -480,7 +477,7 @@ def write_currency_template_sheet(ws, currency: str,
     # 라자다 환율: 큐텐과 동일하게 평균환율 사용
     lazada_rate = (lazada_rate_override if lazada_rate_override is not None
                    else rates.get(currency, {}).get('average', 0.0))
-    divisor     = RATE_DIVISOR.get(currency, 1)   # VND·JPY → 100, 나머지 → 1
+    divisor     = RATE_DIVISOR.get(currency, 1)
 
     # ── 쇼피 소계: 같은 통화의 PDF가 여러 개여도 모두 합산합니다. ──
     if isinstance(shopee_data, list):
@@ -738,7 +735,7 @@ def write_ebay_receipt_sheet(ws, ebay_data: dict, rates: dict, submitter: dict =
 def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter: dict = None):
     """
     큐텐(소포수령증) 시트
-    jpy_rate: 큐텐 반기말(6월/12월) 공식 월평균환율의 대표값 (100엔 기준)
+    jpy_rate: 큐텐 반기말(6월/12월) 공식 월평균환율의 대표값 (1엔 기준)
     """
     ws['A1'] = '해외배송 소포 수령증'
     _style(ws['A1'], font=FONT_TITLE, align=CENTER)
@@ -789,10 +786,10 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
             'qty':    qoo10_data.get('qty', 0),
             'amount': qoo10_data.get('amount', 0),
             'rate':   jpy_rate,
-            'krw':    round(qoo10_data.get('amount', 0) * jpy_rate / 100),
+            'krw':    round(qoo10_data.get('amount', 0) * jpy_rate),
         }]
 
-        ws.cell(row=18, column=8, value='적용: 반기말 월평균환율 (100엔)')
+        ws.cell(row=18, column=8, value='적용: 반기말 월평균환율 (1엔 기준)')
 
         r = 19
         total_jpy = 0
@@ -801,7 +798,7 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
         for e in entries:
             e_rate = e.get('rate', jpy_rate)
             e_amt  = e.get('amount', 0)
-            e_krw  = e.get('krw', round(e_amt * e_rate / 100))
+            e_krw  = e.get('krw', round(e_amt * e_rate))
             e_qty  = e.get('qty', 0)
             ws.cell(row=r, column=1, value='Qoo10')
             ws.cell(row=r, column=2, value='국제로지스틱')
@@ -882,7 +879,7 @@ def write_summary_sheet(ws, shopee_totals: dict, lazada_totals: dict,
     COUNTRY_NAMES = {
         'MYR': '말레이시아(MYR)', 'PHP': '필리핀(PHP)',
         'SGD': '싱가폴(SGD)', 'THB': '태국(THB)',
-        'TWD': '대만(TWD)', 'VND': '베트남(VND)',
+        'TWD': '대만(TWD)', 'VND': '베트남(VND)', 'IDR': '인도네시아(IDR)',
         'BRL': '브라질(BRL)', 'MXN': '멕시코(MXN)',
         'USD': '미국(USD)', 'EUR': '유로(EUR)', 'GBP': '영국(GBP)',
         'CAD': '캐나다(CAD)', 'AUD': '호주(AUD)',
@@ -949,9 +946,9 @@ def write_summary_sheet(ws, shopee_totals: dict, lazada_totals: dict,
         _sub(row, '큐텐')
         _hdr3(row + 1, '외화', '평균환율', '원화')
         jpy_amount = qoo10_data.get('amount', 0)
-        krw = qoo10_data.get('total_krw') or round(jpy_amount * jpy_rate / 100)
-        # 평균환율 = 실효환율(원화÷외화×100) — 외화·원화와 정확히 일치
-        eff_rate = round(krw * 100 / jpy_amount, 2) if jpy_amount else jpy_rate
+        krw = qoo10_data.get('total_krw') or round(jpy_amount * jpy_rate)
+        # 평균환율 = 실효환율(원화÷외화) — 1엔 기준
+        eff_rate = round(krw / jpy_amount, 2) if jpy_amount else jpy_rate
         data_row = row + 2
         ws.cell(row=data_row, column=2, value=jpy_amount)
         ws.cell(row=data_row, column=3, value=eff_rate)
@@ -969,13 +966,13 @@ def write_summary_sheet(ws, shopee_totals: dict, lazada_totals: dict,
 
 
 # ── 사용 데이터 기준 시트 정리 유틸 ───────────────────────────────
-PREFERRED_CURRENCY_ORDER = ['MYR', 'PHP', 'SGD', 'THB', 'TWD', 'VND', 'BRL', 'MXN', 'USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY']
+PREFERRED_CURRENCY_ORDER = ['MYR', 'PHP', 'SGD', 'THB', 'TWD', 'VND', 'IDR', 'BRL', 'MXN', 'USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY']
 SHOPEE_SHEET_NAMES = {
     'MYR': '쇼피(MYR)', 'PHP': '쇼피(PHP)', 'SGD': '쇼피(SGD)',
-    'THB': '쇼피(THB)', 'TWD': '쇼피(TWD)', 'VND': '쇼피(VND)',
+    'THB': '쇼피(THB)', 'TWD': '쇼피(TWD)', 'VND': '쇼피(VND)', 'IDR': '쇼피(IDR)',
     'BRL': '쇼피(BRL)', 'MXN': '쇼피(MXN)',
 }
-LAZADA_CURRENCY_ORDER = ['MYR', 'PHP', 'SGD', 'VND']
+LAZADA_CURRENCY_ORDER = ['MYR', 'PHP', 'SGD', 'VND', 'IDR']
 
 
 def _ordered_currencies(values):
@@ -1234,7 +1231,7 @@ def write_monthly_summary_sheet(ws, shopee_results: list, lazada_result: Optiona
             amount = float(e.get('amount', 0) or 0)
             qty = int(e.get('qty', 0) or 0)
             rate = e.get('rate', jpy_rate)
-            krw = e.get('krw', round(amount * rate / 100))
+            krw = e.get('krw', round(amount * rate))
             date_value = _qoo10_reporting_date(e, qoo10_result)
             rows.append({
                 'month': _month_label_from_date(date_value),
@@ -1397,7 +1394,7 @@ def generate_excel(
             e['rate'] = round(r, 2)
             e['rate_month'] = report_month
             e['rate_source'] = 'SMBS_MON_AVG_OFFICIAL'
-            e['krw'] = round(float(e.get('amount', 0) or 0) * e['rate'] / 100)
+            e['krw'] = round(float(e.get('amount', 0) or 0) * e['rate'])
             q_total_krw += e['krw']
         qoo10_result['entries'] = q_entries
         qoo10_result['amount'] = sum(float(e.get('amount', 0) or 0) for e in q_entries)
@@ -1405,7 +1402,7 @@ def generate_excel(
         qoo10_result['total_krw'] = q_total_krw
         # 여러 반기 자료가 함께 있으면 총집계 표시는 외화금액 가중 실효환율로 표시합니다.
         if qoo10_result['amount']:
-            jpy_rate = round(q_total_krw * 100 / qoo10_result['amount'], 2)
+            jpy_rate = round(q_total_krw / qoo10_result['amount'], 2)
 
     # ── 제출자(판매자) 정보: PDF에서 자동 추출, 없으면 기본값 ──
     report_submitter = None

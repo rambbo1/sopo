@@ -14,7 +14,7 @@ from openpyxl.utils import get_column_letter
 
 from .exchange_rate import get_rate_for_date, avg_rate_for_period, monthly_avg_rate_for_month
 
-RATE_DIVISOR = {"JPY": 100, "VND": 100}
+RATE_DIVISOR = {}  # 환율은 exchange_rate에서 1통화 단위로 정규화됨
 TRACKING_NO_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{13}$", re.I)
 
 # 수출실적명세서/통화 시트의 수출신고번호는 공란, 기타영세율건수는 1로 신고합니다.
@@ -193,7 +193,7 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, e
             report_month = f"{report_digits[:4]}-{report_digits[4:6]}" if len(report_digits) >= 6 else ""
             rate = monthly_avg_rate_for_month(rates.get("JPY"), report_month)
             amount = float(e.get("amount", 0) or 0)
-            krw = round(amount * rate / 100)
+            krw = round(amount * rate)
             tracking = e.get("tracking_no", "") or qoo10_result.get("tracking_no", "")
             ship_date = date_to_int(report_date)
             rows.append({
