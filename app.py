@@ -39,7 +39,7 @@ from modules.extra_docs import (
     safe_filename,
 )
 
-CURRENCIES = ["MYR", "PHP", "SGD", "THB", "TWD", "VND", "JPY", "BRL", "MXN", "USD", "EUR", "GBP", "CAD", "AUD"]
+CURRENCIES = ["MYR", "PHP", "SGD", "THB", "TWD", "VND", "IDR", "JPY", "BRL", "MXN", "USD", "EUR", "GBP", "CAD", "AUD"]
 
 # ── 선택적 로그인: Streamlit secrets [auth]가 있을 때만 사용 ────────────
 ALLOWED_EMAILS = [
