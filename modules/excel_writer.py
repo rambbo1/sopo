@@ -68,13 +68,19 @@ def _applied_rate_format(currency: str) -> str:
     return NUM_FMT4 if str(currency or '').upper() in HUNDRED_UNIT_CURRENCIES else NUM_FMT2
 
 
+def _applied_rate_value(currency: str, value) -> float:
+    """신고/집계용 1통화 단위 환율. 구형 100통화 캐시도 안전하게 정규화합니다."""
+    from .exchange_rate import round_applied_rate
+    return round_applied_rate(currency, value)
+
+
 def _smbs_display_rate(currency: str, value):
-    """환율(통화) 시트 표시용: JPY/IDR/VND는 서울외국환중개 100통화 단위로 복원."""
+    """환율(통화) 시트 표시용 SMBS 고시단위 값을 반환합니다."""
     if value in (None, ''):
         return value
     try:
-        multiplier = 100.0 if str(currency or '').upper() in HUNDRED_UNIT_CURRENCIES else 1.0
-        return float(value) * multiplier
+        from .exchange_rate import smbs_source_rate
+        return smbs_source_rate(currency, value)
     except (TypeError, ValueError):
         return value
 
@@ -183,13 +189,13 @@ def _get_rate(rates: dict, currency: str, date_str: str) -> float:
         return 0.0
     # daily 데이터가 없으면 average 반환 (수동입력 모드)
     if not rate_data.get('daily'):
-        return rate_data.get('average', 0.0)
+        return _applied_rate_value(currency, rate_data.get('average', 0.0))
     if not date_str:
-        return rate_data.get('average', 0.0)
+        return _applied_rate_value(currency, rate_data.get('average', 0.0))
     rate = get_rate_for_date(rate_data, date_str)
     if rate == 0.0:
         rate = rate_data.get('average', 0.0)
-    return rate
+    return _applied_rate_value(currency, rate)
 
 
 # ── 환율 시트 작성 ──────────────────────────────────────────────
@@ -505,8 +511,11 @@ def write_currency_template_sheet(ws, currency: str,
     ws.column_dimensions['G'].width = 14
 
     # 라자다 환율: 큐텐과 동일하게 평균환율 사용
-    lazada_rate = (lazada_rate_override if lazada_rate_override is not None
-                   else rates.get(currency, {}).get('average', 0.0))
+    lazada_rate = _applied_rate_value(
+        currency,
+        lazada_rate_override if lazada_rate_override is not None
+        else rates.get(currency, {}).get('average', 0.0),
+    )
     divisor     = RATE_DIVISOR.get(currency, 1)
 
     # ── 쇼피 소계: 같은 통화의 PDF가 여러 개여도 모두 합산합니다. ──
@@ -554,7 +563,7 @@ def write_currency_template_sheet(ws, currency: str,
     for it in ebay_items:
         amount = float(it.get('amount', 0) or 0)
         month_key = it.get('month') or it.get('date') or it.get('period_end') or ''
-        rate = monthly_avg_rate_for_month(rates.get(currency), month_key)
+        rate = _applied_rate_value(currency, monthly_avg_rate_for_month(rates.get(currency), month_key))
         ebay_fx += amount
         ebay_krw += round(amount * rate / divisor)
 
@@ -750,7 +759,7 @@ def write_ebay_receipt_sheet(ws, ebay_data: dict, rates: dict, submitter: dict =
     for item in ebay_data.get('items', []):
         r += 1
         cur = item.get('currency','')
-        rate = monthly_avg_rate_for_month(rates.get(cur), item.get('month') or '')
+        rate = _applied_rate_value(cur, monthly_avg_rate_for_month(rates.get(cur), item.get('month') or ''))
         div = RATE_DIVISOR.get(cur, 1)
         amount = float(item.get('amount',0) or 0)
         krw = round(amount * rate / div)
@@ -826,7 +835,7 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
         total_krw = 0
         total_qty = 0
         for e in entries:
-            e_rate = e.get('rate', jpy_rate)
+            e_rate = _applied_rate_value('JPY', e.get('rate', jpy_rate))
             e_amt  = e.get('amount', 0)
             e_krw  = e.get('krw', round(e_amt * e_rate))
             e_qty  = e.get('qty', 0)
@@ -850,7 +859,7 @@ def write_qoo10_sheet(ws, qoo10_data: Optional[dict], jpy_rate: float, submitter
         ws.cell(row=r, column=1, value='당기 해외배송 합계')
         ws.cell(row=r, column=6, value=f"{total_qty} 건")
         ws.cell(row=r, column=7, value=total_jpy)
-        ws.cell(row=r, column=8, value=jpy_rate)
+        ws.cell(row=r, column=8, value=_applied_rate_value('JPY', jpy_rate))
         ws.cell(row=r, column=9, value=total_krw)
         for col in range(1, 10):
             nf = NUM_FMT if col in (7, 9) else (_applied_rate_format('JPY') if col == 8 else None)
@@ -980,13 +989,13 @@ def write_summary_sheet(ws, shopee_totals: dict, lazada_totals: dict,
         jpy_amount = qoo10_data.get('amount', 0)
         krw = qoo10_data.get('total_krw') or round(jpy_amount * jpy_rate)
         # 평균환율 = 실효환율(원화÷외화) — 1엔 기준
-        eff_rate = round(krw / jpy_amount, 2) if jpy_amount else jpy_rate
+        eff_rate = _applied_rate_value('JPY', krw / jpy_amount if jpy_amount else jpy_rate)
         data_row = row + 2
         ws.cell(row=data_row, column=2, value=jpy_amount)
         ws.cell(row=data_row, column=3, value=eff_rate)
         ws.cell(row=data_row, column=4, value=krw)
         _style(ws.cell(row=data_row, column=2), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM)
-        _style(ws.cell(row=data_row, column=3), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM2)
+        _style(ws.cell(row=data_row, column=3), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=_applied_rate_format('JPY'))
         _style(ws.cell(row=data_row, column=4), font=FONT_DEFAULT, align=RIGHT, border=THIN_BORDER, num_format=NUM)
         written_platforms += 1
 
@@ -1231,7 +1240,7 @@ def write_monthly_summary_sheet(ws, shopee_results: list, lazada_result: Optiona
             amount = float(it.get('amount', 0) or 0)
             qty = int(it.get('qty', 0) or 0)
             div = RATE_DIVISOR.get(cur, 1)
-            rate = lazada_avg_rates.get(cur, rates.get(cur, {}).get('average', 0.0))
+            rate = _applied_rate_value(cur, lazada_avg_rates.get(cur, rates.get(cur, {}).get('average', 0.0)))
             krw = round(amount * rate / div)
             rows.append({
                 'month': _month_label_from_date(date_value),
@@ -1249,7 +1258,7 @@ def write_monthly_summary_sheet(ws, shopee_results: list, lazada_result: Optiona
             amount = float(it.get('amount', 0) or 0)
             qty = int(it.get('qty', 0) or 0)
             div = RATE_DIVISOR.get(cur, 1)
-            rate = monthly_avg_rate_for_month(rates.get(cur), it.get('month') or it.get('date') or '')
+            rate = _applied_rate_value(cur, monthly_avg_rate_for_month(rates.get(cur), it.get('month') or it.get('date') or ''))
             krw = round(amount * rate / div)
             rows.append({
                 'month': _month_label_from_date((it.get('month') or '').replace('-', '') + '01'),
@@ -1394,14 +1403,14 @@ def generate_excel(
     if jpy_rate_data:
         # 표시·폴백용 대표값. 실제 계산은 아래에서 건별 반기말 월평균환율을 사용합니다.
         monthly_values = [
-            round(float(row.get('rate', 0) or 0), 4)
+            _applied_rate_value('JPY', row.get('rate', 0))
             for row in (jpy_rate_data.get('monthly', []) or [])
             if float(row.get('rate', 0) or 0) > 0
         ]
         if monthly_values:
             jpy_rate = monthly_values[0]
         else:
-            jpy_rate = round(float(jpy_rate_data.get('monthly_average', 0) or 0), 4)
+            jpy_rate = _applied_rate_value('JPY', jpy_rate_data.get('monthly_average', 0))
 
     # 큐텐 신고/집계 기준일은 작성일이 아니라 거래기간 종료일입니다.
     qoo10_report_date = ''
@@ -1422,8 +1431,8 @@ def generate_excel(
         q_total_krw = 0
         for e in q_entries:
             report_month = _qoo10_reporting_month(e, qoo10_result)
-            r = monthly_avg_rate_for_month(jpy_rate_data, report_month)
-            e['rate'] = round(r, 4)
+            r = _applied_rate_value('JPY', monthly_avg_rate_for_month(jpy_rate_data, report_month))
+            e['rate'] = r
             e['rate_month'] = report_month
             e['rate_source'] = 'SMBS_MON_AVG_OFFICIAL'
             e['krw'] = round(float(e.get('amount', 0) or 0) * e['rate'])
@@ -1434,7 +1443,7 @@ def generate_excel(
         qoo10_result['total_krw'] = q_total_krw
         # 여러 반기 자료가 함께 있으면 총집계 표시는 외화금액 가중 실효환율로 표시합니다.
         if qoo10_result['amount']:
-            jpy_rate = round(q_total_krw / qoo10_result['amount'], 4)
+            jpy_rate = _applied_rate_value('JPY', q_total_krw / qoo10_result['amount'])
 
     # ── 제출자(판매자) 정보: PDF에서 자동 추출, 없으면 기본값 ──
     report_submitter = None
@@ -1503,7 +1512,7 @@ def generate_excel(
             cur = it.get('currency', '')
             if not cur:
                 continue
-            rate = monthly_avg_rate_for_month(rates.get(cur), it.get('month') or it.get('date') or '')
+            rate = _applied_rate_value(cur, monthly_avg_rate_for_month(rates.get(cur), it.get('month') or it.get('date') or ''))
             div = RATE_DIVISOR.get(cur, 1)
             amount = float(it.get('amount', 0) or 0)
             krw = round(amount * rate / div)
@@ -1572,7 +1581,7 @@ def generate_excel(
             ws_jpy.cell(row=_jr, column=2, value=1)
             ws_jpy.cell(row=_jr, column=3, value=date_str or None)
             ws_jpy.cell(row=_jr, column=4, value='JPY')
-            ws_jpy.cell(row=_jr, column=5, value=e.get('rate', jpy_rate)).number_format = _applied_rate_format('JPY')
+            ws_jpy.cell(row=_jr, column=5, value=_applied_rate_value('JPY', e.get('rate', jpy_rate))).number_format = _applied_rate_format('JPY')
             ws_jpy.cell(row=_jr, column=6, value=e.get('amount', 0)).number_format = NUM_FMT
             ws_jpy.cell(row=_jr, column=7, value=e.get('krw', 0)).number_format = NUM_FMT
             _jr += 1

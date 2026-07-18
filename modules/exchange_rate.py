@@ -115,25 +115,47 @@ def to_number(value):
         return None
 
 
-def normalize_smbs_rate(currency: str, value):
-    """SMBS 고시단위를 1통화 단위 원화환율로 변환합니다.
+def _looks_like_smbs_source_unit(currency: str, rate: float) -> bool:
+    """값이 SMBS의 100통화 고시단위인지 판별합니다.
 
-    JPY/IDR/VND는 사이트에서 100통화 단위로 고시되므로 100으로 나눕니다.
-    그 외 통화는 원본 값을 그대로 사용합니다.
+    기존 캐시/수동입력에 100통화 값과 1통화 값이 섞여 있어도
+    JPY·IDR·VND가 다시 100으로 나뉘거나, 반대로 나뉘지 않는 문제를 막습니다.
+    """
+    cur = str(currency or "").upper()
+    if cur == "JPY":
+        return abs(float(rate)) >= 100.0
+    if cur in {"IDR", "VND"}:
+        return abs(float(rate)) >= 1.0
+    return False
+
+
+def normalize_smbs_rate(currency: str, value):
+    """환율을 계산용 1통화 단위로 정규화합니다.
+
+    서울외국환중개가 JPY·IDR·VND를 100통화 단위로 제공한 값이면 100으로
+    나누고, 이미 1통화 단위로 저장된 값이면 그대로 사용합니다.
     """
     rate = to_number(value)
     if rate is None:
         return None
-    divisor = SMBS_SOURCE_UNIT_DIVISOR.get(str(currency or "").upper(), 1.0)
-    return float(rate) / float(divisor)
+    cur = str(currency or "").upper()
+    divisor = SMBS_SOURCE_UNIT_DIVISOR.get(cur, 1.0)
+    if divisor != 1.0 and _looks_like_smbs_source_unit(cur, rate):
+        return float(rate) / float(divisor)
+    return float(rate)
 
 
 def smbs_source_rate(currency: str, value):
-    """1통화 단위 내부 환율을 서울외국환중개 표시단위로 되돌립니다."""
-    rate = to_number(value)
+    """환율(통화) 시트용 SMBS 표시단위로 변환합니다.
+
+    입력값이 이미 100통화 단위이든 1통화 단위이든 결과는 항상
+    서울외국환중개 원문과 같은 100통화 단위가 됩니다.
+    """
+    cur = str(currency or "").upper()
+    rate = normalize_smbs_rate(cur, value)
     if rate is None:
         return None
-    multiplier = SMBS_SOURCE_UNIT_DIVISOR.get(str(currency or "").upper(), 1.0)
+    multiplier = SMBS_SOURCE_UNIT_DIVISOR.get(cur, 1.0)
     return float(rate) * float(multiplier)
 
 
@@ -143,7 +165,8 @@ def applied_rate_precision(currency: str) -> int:
 
 
 def round_applied_rate(currency: str, value) -> float:
-    rate = to_number(value)
+    """계산/신고서에 사용할 1통화 단위 환율을 통화별 자릿수로 반올림합니다."""
+    rate = normalize_smbs_rate(currency, value)
     if rate is None:
         return 0.0
     return round(float(rate), applied_rate_precision(currency))
@@ -855,9 +878,10 @@ def _date_index(rate_data):
     if idx is not None:
         return idx
     exact = {}
+    currency = str(rate_data.get("currency", "") or "").upper()
     for d in rate_data.get("daily", []):
         key = _norm_date_key(d.get("date"))
-        rate = to_number(d.get("rate"))
+        rate = normalize_smbs_rate(currency, d.get("rate"))
         if key and rate is not None:
             exact[key] = float(rate)
     dates = sorted(exact.keys())
@@ -867,39 +891,43 @@ def _date_index(rate_data):
 
 
 def get_rate_for_date(rate_data: dict, date_str: str) -> float:
-    """특정 날짜 환율 반환. 없으면 가장 가까운 이전 영업일 환율 사용.
-    기존 GitHub처럼 날짜 색인을 캐싱해서 대량 거래 계산 속도를 높입니다.
+    """특정 날짜의 계산용 1통화 환율을 반환합니다.
+
+    캐시에 SMBS 100통화 값이 남아 있더라도 JPY·IDR·VND는 여기서 다시
+    안전하게 1통화 단위로 정규화합니다.
     """
     if not rate_data:
         return 0.0
+    currency = str(rate_data.get("currency", "") or "").upper()
     if not rate_data.get("daily"):
-        return float(rate_data.get("average", 0.0) or 0.0)
+        return round_applied_rate(currency, rate_data.get("average", 0.0))
     target = _norm_date_key(date_str)
     if not target:
-        return float(rate_data.get("average", 0.0) or 0.0)
+        return round_applied_rate(currency, rate_data.get("average", 0.0))
     idx = _date_index(rate_data)
     if target in idx["exact"]:
-        return float(idx["exact"][target])
+        return round_applied_rate(currency, idx["exact"][target])
     dates = idx["dates"]
     rates = idx["rates"]
     if not dates:
-        return float(rate_data.get("average", 0.0) or 0.0)
+        return round_applied_rate(currency, rate_data.get("average", 0.0))
     pos = bisect.bisect_right(dates, target)
     if pos <= 0:
-        return float(rates[0])
-    return float(rates[pos - 1])
+        return round_applied_rate(currency, rates[0])
+    return round_applied_rate(currency, rates[pos - 1])
 
 
 def avg_rate_for_period(rate_data: dict, start: str, end: str) -> float:
-    """기간 평균환율. pandas DataFrame 재생성을 피하고 날짜 색인을 재사용합니다."""
+    """기간 평균 계산용 1통화 환율을 반환합니다."""
     if not rate_data:
         return 0.0
+    currency = str(rate_data.get("currency", "") or "").upper()
     if not rate_data.get("daily"):
-        return float(rate_data.get("average", 0.0) or 0.0)
+        return round_applied_rate(currency, rate_data.get("average", 0.0))
     s = _norm_date_key(start)
     e = _norm_date_key(end)
     if not s and not e:
-        return float(rate_data.get("average", 0.0) or 0.0)
+        return round_applied_rate(currency, rate_data.get("average", 0.0))
     if not s:
         s = e
     if not e:
@@ -909,13 +937,13 @@ def avg_rate_for_period(rate_data: dict, start: str, end: str) -> float:
     idx = _date_index(rate_data)
     dates, rates = idx["dates"], idx["rates"]
     if not dates:
-        return float(rate_data.get("average", 0.0) or 0.0)
+        return round_applied_rate(currency, rate_data.get("average", 0.0))
     left = bisect.bisect_left(dates, s)
     right = bisect.bisect_right(dates, e)
     vals = [r for r in rates[left:right] if r and r > 0]
     if vals:
         return round_applied_rate(rate_data.get("currency", ""), sum(vals) / len(vals))
-    return get_rate_for_date(rate_data, e) or float(rate_data.get("average", 0.0) or 0.0)
+    return get_rate_for_date(rate_data, e) or round_applied_rate(currency, rate_data.get("average", 0.0))
 
 
 # ────────────────────────────────────────────────────────────────

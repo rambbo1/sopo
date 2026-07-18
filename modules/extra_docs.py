@@ -12,7 +12,10 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from .exchange_rate import get_rate_for_date, avg_rate_for_period, monthly_avg_rate_for_month
+from .exchange_rate import (
+    get_rate_for_date, avg_rate_for_period, monthly_avg_rate_for_month,
+    round_applied_rate,
+)
 
 RATE_DIVISOR = {}  # 환율은 exchange_rate에서 1통화 단위로 정규화됨
 HUNDRED_UNIT_CURRENCIES = {'JPY', 'IDR', 'VND'}
@@ -22,6 +25,11 @@ RATE_FMT4 = '#,##0.0000'
 
 def applied_rate_format(currency: str) -> str:
     return RATE_FMT4 if str(currency or '').upper() in HUNDRED_UNIT_CURRENCIES else RATE_FMT2
+
+
+def applied_rate_value(currency: str, value) -> float:
+    """영세율/수출실적에 기록할 계산용 1통화 환율."""
+    return round_applied_rate(currency, value)
 TRACKING_NO_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{13}$", re.I)
 
 # 수출실적명세서/통화 시트의 수출신고번호는 공란, 기타영세율건수는 1로 신고합니다.
@@ -115,7 +123,7 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, e
         cur = sd.get("currency", "")
         div = RATE_DIVISOR.get(cur, 1)
         for tx in sd.get("transactions", []):
-            rate = get_rate_for_date(rates.get(cur), tx.get("date", ""))
+            rate = applied_rate_value(cur, get_rate_for_date(rates.get(cur), tx.get("date", "")))
             amount = float(tx.get("amount", 0) or 0)
             krw = round(amount * rate / div)
             tracking = tx.get("tracking_no", "")
@@ -142,7 +150,7 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, e
         for it in lazada_result.get("items", []):
             cur = it.get("currency", "")
             div = RATE_DIVISOR.get(cur, 1)
-            rate = avg_rate_for_period(rates.get(cur), ps, pe)
+            rate = applied_rate_value(cur, avg_rate_for_period(rates.get(cur), ps, pe))
             amount = float(it.get("amount", 0) or 0)
             krw = round(amount * rate / div)
             tracking = it.get("tracking_no", "")
@@ -167,7 +175,7 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, e
             if not cur:
                 continue
             div = RATE_DIVISOR.get(cur, 1)
-            rate = monthly_avg_rate_for_month(rates.get(cur), it.get("month") or it.get("date") or "")
+            rate = applied_rate_value(cur, monthly_avg_rate_for_month(rates.get(cur), it.get("month") or it.get("date") or ""))
             amount = float(it.get("amount", 0) or 0)
             krw = round(amount * rate / div)
             ship_date = date_to_int(it.get("date") or it.get("period_end") or "")
@@ -198,7 +206,7 @@ def build_declaration_rows(shopee_results, lazada_result, qoo10_result, rates, e
             report_date = qoo10_reporting_date(e, qoo10_result)
             report_digits = re.sub(r"\D", "", str(report_date or ""))[:8]
             report_month = f"{report_digits[:4]}-{report_digits[4:6]}" if len(report_digits) >= 6 else ""
-            rate = monthly_avg_rate_for_month(rates.get("JPY"), report_month)
+            rate = applied_rate_value("JPY", monthly_avg_rate_for_month(rates.get("JPY"), report_month))
             amount = float(e.get("amount", 0) or 0)
             krw = round(amount * rate)
             tracking = e.get("tracking_no", "") or qoo10_result.get("tracking_no", "")
@@ -284,7 +292,8 @@ def create_export_performance(rows, output_dir: Path, company: str, base_dir: Op
     for idx, r in enumerate(rows, start_row):
         if idx > start_row:
             _copy_style(ws, start_row, idx, max_col)
-        vals = [r["export_no"], r["other_count"], r["ship_date"], r["currency"], r["rate"], r["foreign"], r["krw"]]
+        rate_value = applied_rate_value(r.get("currency"), r.get("rate"))
+        vals = [r["export_no"], r["other_count"], r["ship_date"], r["currency"], rate_value, r["foreign"], r["krw"]]
         for c, v in enumerate(vals, 1):
             ws.cell(idx, c, v)
         ws.cell(idx, 5).number_format = applied_rate_format(r.get("currency"))
@@ -303,9 +312,10 @@ def _write_zero_sheet(ws, rows):
     for idx, r in enumerate(rows, start_row):
         if idx > start_row:
             _copy_style(ws, start_row, idx, max_col)
+        rate_value = applied_rate_value(r.get("currency"), r.get("rate"))
         vals = [
             1, "소포수령증", r["issuer"], r["issue_date"], r["ship_date"], r.get("tracking_no", ""), "",
-            r["currency"], r["rate"], r["foreign"], r["krw"], r["foreign"], r["krw"], 0, 0,
+            r["currency"], rate_value, r["foreign"], r["krw"], r["foreign"], r["krw"], 0, 0,
         ]
         for c, v in enumerate(vals, 1):
             ws.cell(idx, c, v)
